@@ -1,0 +1,4 @@
+model,method,avg_step_time_ms,throughput_samples_per_s
+resnet50,lowbit_no_sr,183.15575798624195,87.35734096441493
+resnet50,lowbit_sr,31.264490098692477,511.7627042530638
+resnet50,no_compression,39.60236898274161,404.01623465941316

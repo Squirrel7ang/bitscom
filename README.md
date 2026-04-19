@@ -208,6 +208,48 @@ Preview:
 
 ![Error-feedback multi-bitwidth summary](benchmarks/outputs/ef_multibitwidth_summary.png)
 
+### E2E Loss Curve: Stochastic Rounding vs No Stochastic Rounding
+
+Generate end-to-end distributed training loss curves comparing:
+
+- `stochastic_rounding=False`
+- `stochastic_rounding=True`
+- no-compression baseline (full-precision all-reduce path)
+
+Run (2 GPUs):
+
+```bash
+torchrun --nproc_per_node=2 benchmarks/stochastic_rounding_e2e_curve.py --bitwidth 4 --steps 160 --batch-size 128
+```
+
+Outputs:
+
+- `benchmarks/outputs/e2e_loss_curve_stochastic_vs_nocompress_bw4.csv`
+- `benchmarks/outputs/e2e_loss_curve_stochastic_vs_nocompress_bw4.png`
+
+### Multi-Model E2E Comparison (ResNet50 / BERT / GPT-2)
+
+Run distributed end-to-end comparisons across multiple model families:
+
+- lowbit without stochastic rounding
+- lowbit with stochastic rounding
+- no-compression baseline
+
+Example (2 GPUs):
+
+```bash
+torchrun --nproc_per_node=2 benchmarks/multimodel_stochastic_e2e_curve.py --models resnet50 bert gpt2 --bitwidth 4 --steps 80 --batch-size 8 --dataset-size 512
+```
+
+Per-model outputs:
+
+- `benchmarks/outputs/multimodel_resnet50_loss_curve_bw4.csv`
+- `benchmarks/outputs/multimodel_resnet50_loss_curve_bw4.png`
+- `benchmarks/outputs/multimodel_bert_loss_curve_bw4.csv`
+- `benchmarks/outputs/multimodel_bert_loss_curve_bw4.png`
+- `benchmarks/outputs/multimodel_gpt2_loss_curve_bw4.csv`
+- `benchmarks/outputs/multimodel_gpt2_loss_curve_bw4.png`
+
 ## Backend Registration Options
 
 Use explicit backend options when registering:

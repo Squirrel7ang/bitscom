@@ -368,6 +368,31 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduce_scatter(
     return nccl_pg_->reduce_scatter(output_tensors, input_tensors, opts);
 }
 
+c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::alltoall(
+    std::vector<at::Tensor>& output_tensors,
+    std::vector<at::Tensor>& input_tensors,
+    const c10d::AllToAllOptions& opts) {
+
+    // 复用 NCCL 的 alltoall 实现，供 Python dist.all_to_all 直接调用。
+    return nccl_pg_->alltoall(output_tensors, input_tensors, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::alltoall_base(
+    at::Tensor& output_tensor,
+    at::Tensor& input_tensor,
+    std::vector<int64_t>& output_split_sizes,
+    std::vector<int64_t>& input_split_sizes,
+    const c10d::AllToAllOptions& opts) {
+
+    // 复用 NCCL 的 alltoall_base 实现，兼容 all_to_all_single 路径。
+    return nccl_pg_->alltoall_base(
+        output_tensor,
+        input_tensor,
+        output_split_sizes,
+        input_split_sizes,
+        opts);
+}
+
 // ---- 工厂函数 ----
 
 c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(

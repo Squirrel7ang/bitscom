@@ -80,7 +80,17 @@ public:
         std::vector<at::Tensor>& tensors,
         const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override;
 
-    // 后续可添加 alltoall 等
+    c10::intrusive_ptr<c10d::Work> alltoall(
+        std::vector<at::Tensor>& output_tensors,
+        std::vector<at::Tensor>& input_tensors,
+        const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
+
+    c10::intrusive_ptr<c10d::Work> alltoall_base(
+        at::Tensor& output_tensor,
+        at::Tensor& input_tensor,
+        std::vector<int64_t>& output_split_sizes,
+        std::vector<int64_t>& input_split_sizes,
+        const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
 
 private:
     // 底层 NCCL process group
