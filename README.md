@@ -281,6 +281,42 @@ per-mode CSVs, you can re-plot without rerunning training:
 python benchmarks/error_feedback_multimodel_summary.py --skip-run
 ```
 
+### Collective Compare: allreduce / reduce_scatter
+
+Compare lowbit collectives against a full-precision NCCL baseline, exporting
+per-step error + timing CSVs and plots.
+
+Single bitwidth (2 GPUs):
+
+```bash
+torchrun --nproc_per_node=2 benchmarks/collective_compare.py \
+	--collective allreduce \
+	--bitwidth 4 \
+	--steps 60 \
+	--numel 262144
+```
+
+Outputs:
+
+- `benchmarks/outputs/collective_compare_allreduce_bw4.csv`
+- `benchmarks/outputs/collective_compare_allreduce_bw4.png`
+
+Multi-bitwidth sweep with summary plot:
+
+```bash
+python benchmarks/collective_compare_multibw.py \
+	--collective reduce_scatter \
+	--bitwidths 1 2 4 8 \
+	--steps 60 \
+	--numel 262144 \
+	--nproc 2
+```
+
+Summary outputs:
+
+- `benchmarks/outputs/collective_compare_reduce_scatter_summary.csv`
+- `benchmarks/outputs/collective_compare_reduce_scatter_summary.png`
+
 ## Backend Registration Options
 
 Use explicit backend options when registering:

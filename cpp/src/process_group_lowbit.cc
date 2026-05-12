@@ -465,9 +465,108 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduce_scatter(
     std::vector<std::vector<at::Tensor>>& input_tensors,
     const c10d::ReduceScatterOptions& opts) {
 
-    // TODO: 对 input 做 pack，对 output 做 unpack
-    // 当前占位：直接转发到 NCCL
-    return nccl_pg_->reduce_scatter(output_tensors, input_tensors, opts);
+    if (output_tensors.empty() || input_tensors.empty()) {
+        return nccl_pg_->reduce_scatter(output_tensors, input_tensors, opts);
+    }
+
+    if (options_.bitwidth >= 16 ||
+        opts.reduceOp != c10d::ReduceOp::SUM ||
+        getSize() <= 1) {
+        return nccl_pg_->reduce_scatter(output_tensors, input_tensors, opts);
+    }
+
+    TORCH_CHECK(
+        output_tensors.size() == input_tensors.size(),
+        "reduce_scatter expects output_tensors.size == input_tensors.size, got output=",
+        output_tensors.size(), " input=", input_tensors.size());
+
+    const int world_size = getSize();
+    const int rank = getRank();
+
+    struct ReduceScatterState {
+        at::Tensor output;
+        int64_t out_numel = 0;
+        std::vector<at::Tensor> recv_packed;
+        std::vector<at::Tensor> recv_scales;
+        std::vector<at::Tensor> send_packed;
+        std::vector<at::Tensor> send_scales;
+    };
+
+    auto state = std::make_shared<std::vector<ReduceScatterState>>();
+    state->reserve(output_tensors.size());
+
+    c10d::AllToAllOptions alltoall_opts;
+    std::vector<c10::intrusive_ptr<c10d::Work>> phase1_works;
+
+    for (size_t idx = 0; idx < output_tensors.size(); ++idx) {
+        auto& output = output_tensors[idx];
+        auto& inputs = input_tensors[idx];
+
+        TORCH_CHECK(
+            inputs.size() == static_cast<size_t>(world_size),
+            "reduce_scatter expects input_tensors[", idx, "] size == world_size, got ",
+            inputs.size(), " vs ", world_size);
+
+        ReduceScatterState s;
+        s.output = output;
+        s.out_numel = output.numel();
+
+        TORCH_CHECK(
+            s.out_numel == inputs[rank].numel(),
+            "reduce_scatter output numel mismatch at index ", idx,
+            ": output=", s.out_numel, " input[rank]=", inputs[rank].numel());
+
+        s.send_packed.reserve(world_size);
+        s.recv_packed.reserve(world_size);
+        s.send_scales.reserve(world_size);
+        s.recv_scales.reserve(world_size);
+
+        for (int shard_idx = 0; shard_idx < world_size; ++shard_idx) {
+            auto& shard = inputs[shard_idx];
+            TORCH_CHECK(
+                shard.numel() == s.out_numel,
+                "reduce_scatter expects equal shard sizes at index ", idx,
+                ": shard=", shard.numel(), " output=", s.out_numel);
+
+            at::Tensor packed, scale;
+            std::tie(packed, scale) = pack(shard);
+            s.send_packed.push_back(packed);
+            s.send_scales.push_back(scale);
+            s.recv_packed.push_back(at::empty_like(packed));
+            s.recv_scales.push_back(at::empty_like(scale));
+        }
+
+        phase1_works.push_back(nccl_pg_->alltoall(s.recv_packed, s.send_packed, alltoall_opts));
+        phase1_works.push_back(nccl_pg_->alltoall(s.recv_scales, s.send_scales, alltoall_opts));
+
+        state->push_back(std::move(s));
+    }
+
+    auto anchor = phase1_works[0];
+    auto post_hook = [this, state, phase1_works, world_size]() mutable -> bool {
+        for (auto& w : phase1_works) {
+            if (!w->wait()) {
+                return false;
+            }
+        }
+
+        for (auto& s : *state) {
+            auto local_sum = at::zeros({s.out_numel}, s.output.options().dtype(at::kFloat));
+            for (int src = 0; src < world_size; ++src) {
+                auto fp = unpack(
+                    s.recv_packed[src],
+                    s.out_numel,
+                    s.recv_scales[src],
+                    s.output.device(),
+                    at::kFloat);
+                local_sum.add_(fp);
+            }
+            s.output.copy_(local_sum.to(s.output.scalar_type()));
+        }
+        return true;
+    };
+
+    return c10::make_intrusive<WorkLowBit>(std::move(anchor), std::move(post_hook));
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::alltoall(

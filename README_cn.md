@@ -239,6 +239,41 @@ python benchmarks/error_feedback_multimodel_summary.py \
 python benchmarks/error_feedback_multimodel_summary.py --skip-run
 ```
 
+### 集合通信对比实验：allreduce / reduce_scatter
+
+对比低比特集体通信与全精度 NCCL 基线，输出每步误差与耗时 CSV 和曲线图。
+
+单比特宽度（2 GPU）：
+
+```bash
+torchrun --nproc_per_node=2 benchmarks/collective_compare.py \
+	--collective allreduce \
+	--bitwidth 4 \
+	--steps 60 \
+	--numel 262144
+```
+
+输出文件：
+
+- `benchmarks/outputs/collective_compare_allreduce_bw4.csv`
+- `benchmarks/outputs/collective_compare_allreduce_bw4.png`
+
+多比特宽度汇总：
+
+```bash
+python benchmarks/collective_compare_multibw.py \
+	--collective reduce_scatter \
+	--bitwidths 1 2 4 8 \
+	--steps 60 \
+	--numel 262144 \
+	--nproc 2
+```
+
+汇总输出：
+
+- `benchmarks/outputs/collective_compare_reduce_scatter_summary.csv`
+- `benchmarks/outputs/collective_compare_reduce_scatter_summary.png`
+
 ## 后端注册参数
 
 可通过显式参数注册后端：
