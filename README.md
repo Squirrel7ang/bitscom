@@ -97,6 +97,14 @@ If using the tested conda environment in this repo:
 /home/aerith/miniforge3/envs/bitscom/bin/python -m pip install -e . --no-build-isolation
 ```
 
+Corex clang++ toolchain build (Corex CUDA at /usr/local/corex-4.4.0):
+
+```bash
+CUDA_HOME=/usr/local/corex-4.4.0 \
+BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++ \
+/root/miniconda3/envs/ytli_test/bin/python -m pip install -e . --no-build-isolation
+```
+
 The extension build now emits `compile_commands.json` at repo root for clangd.
 
 ## Test

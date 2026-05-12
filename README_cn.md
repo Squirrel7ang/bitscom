@@ -97,6 +97,14 @@ pip install -e .
 /home/aerith/miniforge3/envs/bitscom/bin/python -m pip install -e . --no-build-isolation
 ```
 
+Corex clang++ 编译链（Corex CUDA 位于 /usr/local/corex-4.4.0）：
+
+```bash
+CUDA_HOME=/usr/local/corex-4.4.0 \
+BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++ \
+/root/miniconda3/envs/ytli_test/bin/python -m pip install -e . --no-build-isolation
+```
+
 当前扩展构建会在仓库根目录生成 `compile_commands.json`，便于 clangd 索引。
 
 ## 测试
