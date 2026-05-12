@@ -230,5 +230,5 @@ BITSCOM_RUN_PERF=1 conda run -n bitscom pytest -q -m performance
 
 - C++ 侧真实 CUDA quantize/dequantize kernel 仍待实现。
 - `allgather` / `reduce_scatter` 在 C++ backend 内仍是直通 NCCL，未走低比特路径。
-- error-feedback 机制尚未接入通信主流程。
+- error-feedback 已接入 lowbit allreduce（legacy/EF21/EF21+），其余集合通信仍需补齐。
 - 缺少多机多卡的系统级 benchmark 报告脚本（吞吐、延迟、误差联合评估）。

@@ -208,6 +208,37 @@ BITSCOM_RUN_PERF=1 pytest -q -m performance
 
 ![Error-feedback multi-bitwidth summary](benchmarks/outputs/ef_multibitwidth_summary.png)
 
+### Error-Feedback 模式多模型对比（Loss + 开销）
+
+在多个模型上对比 error-feedback 模式（none / legacy / ef21 / ef21_plus），
+输出每个模式的 loss 曲线与综合汇总图：
+
+```bash
+python benchmarks/error_feedback_multimodel_summary.py \
+	--modes none legacy ef21 ef21_plus \
+	--models resnet50 bert gpt2 \
+	--bitwidth 4 \
+	--nproc 2
+```
+
+关键输出：
+
+- `benchmarks/outputs/ef_modes_resnet50_loss_curve_bw4.csv`
+- `benchmarks/outputs/ef_modes_resnet50_loss_curve_bw4.png`
+- `benchmarks/outputs/ef_modes_bert_loss_curve_bw4.csv`
+- `benchmarks/outputs/ef_modes_bert_loss_curve_bw4.png`
+- `benchmarks/outputs/ef_modes_gpt2_loss_curve_bw4.csv`
+- `benchmarks/outputs/ef_modes_gpt2_loss_curve_bw4.png`
+- `benchmarks/outputs/ef_modes_throughput_summary_bw4.csv`
+- `benchmarks/outputs/ef_modes_throughput_summary_bw4.png`
+
+脚本会为每个 EF 模式自动调用 `torchrun`。如果已经有 CSV，
+可跳过训练仅重绘：
+
+```bash
+python benchmarks/error_feedback_multimodel_summary.py --skip-run
+```
+
 ## 后端注册参数
 
 可通过显式参数注册后端：
@@ -217,11 +248,17 @@ import bitscom
 
 # 使用显式参数注册 lowbit backend。
 bitscom.init(bitwidth=4, error_feedback=True)
+
+# 指定 error-feedback 模式（可选）：none / legacy / ef21 / ef21_plus
+bitscom.init(bitwidth=4, error_feedback_mode="ef21")
+bitscom.init(bitwidth=4, error_feedback_mode="ef21_plus")
 ```
 
 说明：
 
-- `error_feedback=True` 当前仅作用于低比特 allreduce 第一段量化。
+- `error_feedback=True` 等价于 `error_feedback_mode="legacy"`。
+- `error_feedback_mode="legacy"` 与 `"ef21"` 仅作用于低比特 allreduce 第一段量化。
+- `error_feedback_mode="ef21_plus"` 会额外在 allreduce 第二段量化（reduced shard）启用 error feedback。
 - 同一进程内若以不同参数重复注册，会按设计抛出错误。
 
 ## 分层 All-Reduce 参数

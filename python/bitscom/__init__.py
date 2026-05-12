@@ -31,9 +31,17 @@ __all__ = [
 __version__ = "0.1.0"
 
 
-def init(bitwidth: int = 4, error_feedback: bool = False):
+def init(
+    bitwidth: int = 4,
+    error_feedback: bool = False,
+    error_feedback_mode: str | None = None,
+):
     """
     初始化 bitscom：注册 lowbit backend。
     应在 torch.distributed.init_process_group 之前调用。
     """
-    register_lowbit_backend(bitwidth=bitwidth, error_feedback=error_feedback)
+    register_lowbit_backend(
+        bitwidth=bitwidth,
+        error_feedback=error_feedback,
+        error_feedback_mode=error_feedback_mode,
+    )

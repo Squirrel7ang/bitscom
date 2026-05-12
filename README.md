@@ -250,6 +250,37 @@ Per-model outputs:
 - `benchmarks/outputs/multimodel_gpt2_loss_curve_bw4.csv`
 - `benchmarks/outputs/multimodel_gpt2_loss_curve_bw4.png`
 
+### Error-Feedback Modes: Multi-Model Loss + Overhead
+
+Sweep error-feedback modes (none / legacy / ef21 / ef21_plus) across models and
+export per-mode loss curves plus a combined summary:
+
+```bash
+python benchmarks/error_feedback_multimodel_summary.py \
+	--modes none legacy ef21 ef21_plus \
+	--models resnet50 bert gpt2 \
+	--bitwidth 4 \
+	--nproc 2
+```
+
+Key outputs:
+
+- `benchmarks/outputs/ef_modes_resnet50_loss_curve_bw4.csv`
+- `benchmarks/outputs/ef_modes_resnet50_loss_curve_bw4.png`
+- `benchmarks/outputs/ef_modes_bert_loss_curve_bw4.csv`
+- `benchmarks/outputs/ef_modes_bert_loss_curve_bw4.png`
+- `benchmarks/outputs/ef_modes_gpt2_loss_curve_bw4.csv`
+- `benchmarks/outputs/ef_modes_gpt2_loss_curve_bw4.png`
+- `benchmarks/outputs/ef_modes_throughput_summary_bw4.csv`
+- `benchmarks/outputs/ef_modes_throughput_summary_bw4.png`
+
+The script runs `torchrun` internally for each EF mode. If you already have
+per-mode CSVs, you can re-plot without rerunning training:
+
+```bash
+python benchmarks/error_feedback_multimodel_summary.py --skip-run
+```
+
 ## Backend Registration Options
 
 Use explicit backend options when registering:
@@ -259,11 +290,17 @@ import bitscom
 
 # Register lowbit backend with explicit options.
 bitscom.init(bitwidth=4, error_feedback=True)
+
+# Specify an error-feedback mode (optional): none / legacy / ef21 / ef21_plus
+bitscom.init(bitwidth=4, error_feedback_mode="ef21")
+bitscom.init(bitwidth=4, error_feedback_mode="ef21_plus")
 ```
 
 Notes:
 
-- `error_feedback=True` currently applies to first-stage quantization in low-bit allreduce.
+- `error_feedback=True` is equivalent to `error_feedback_mode="legacy"`.
+- `error_feedback_mode="legacy"` and `"ef21"` apply to the first-stage quantization in low-bit allreduce.
+- `error_feedback_mode="ef21_plus"` also enables error feedback on the reduced-shard quantization stage.
 - Re-registering backend with different options in the same process raises an error by design.
 
 ## Hierarchical All-Reduce Options

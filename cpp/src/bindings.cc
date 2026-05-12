@@ -9,6 +9,8 @@
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/extension.h>
 
+#include <string>
+
 #include "process_group_lowbit.h"
 
 namespace py = pybind11;
@@ -20,9 +22,10 @@ c10::intrusive_ptr<c10d::Backend> createBackend(
     int size,
     const std::chrono::milliseconds& timeout,
     int bitwidth,
-    bool error_feedback) {
+    bool error_feedback,
+    const std::string& error_feedback_mode) {
     return bitscom::createProcessGroupLowBit(
-        store, rank, size, timeout, bitwidth, error_feedback);
+        store, rank, size, timeout, bitwidth, error_feedback, error_feedback_mode);
 }
 
 PYBIND11_MODULE(_lowbit_c, m) {
@@ -32,7 +35,8 @@ PYBIND11_MODULE(_lowbit_c, m) {
     py::class_<bitscom::LowBitOptions>(m, "LowBitOptions")
         .def(py::init<>())
         .def_readwrite("bitwidth", &bitscom::LowBitOptions::bitwidth)
-        .def_readwrite("error_feedback", &bitscom::LowBitOptions::error_feedback);
+        .def_readwrite("error_feedback", &bitscom::LowBitOptions::error_feedback)
+        .def_readwrite("error_feedback_mode", &bitscom::LowBitOptions::error_feedback_mode);
 
     // 暴露 ProcessGroupLowBit（作为 Backend 的子类）
     py::class_<
@@ -59,5 +63,6 @@ PYBIND11_MODULE(_lowbit_c, m) {
           py::arg("size"),
             py::arg("timeout") = std::chrono::milliseconds(600000),
             py::arg("bitwidth") = 4,
-            py::arg("error_feedback") = false);
+                        py::arg("error_feedback") = false,
+                        py::arg("error_feedback_mode") = "auto");
 }

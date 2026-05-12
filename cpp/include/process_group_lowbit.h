@@ -20,7 +20,15 @@ namespace bitscom {
 struct LowBitOptions {
     int bitwidth = 4;
     bool error_feedback = false;
+    std::string error_feedback_mode = "auto";
     std::chrono::milliseconds timeout = std::chrono::milliseconds(600000);
+};
+
+enum class ErrorFeedbackMode {
+    kDisabled = 0,
+    kLegacy = 1,
+    kEF21 = 2,
+    kEF21Plus = 3,
 };
 
 // Work wrapper: 包装底层 NCCL Work，后续可加 unpack 回调
@@ -98,6 +106,8 @@ private:
 
     LowBitOptions options_;
 
+    ErrorFeedbackMode error_feedback_mode_ = ErrorFeedbackMode::kDisabled;
+
     // ---- pack/unpack 占位 ----
     // 将 float tensor 量化 + 打包为 uint8 buffer，返回 (packed, scale)
     std::tuple<at::Tensor, at::Tensor> pack(const at::Tensor& input);
@@ -114,9 +124,31 @@ private:
         std::vector<at::Tensor>& tensors,
         const c10d::AllreduceOptions& opts);
 
+    bool useStage1ErrorFeedback() const;
+    bool useStage2ErrorFeedback() const;
+
+    struct ResidualShardKey {
+        int64_t tensor_id = 0;
+        int64_t shard_idx = 0;
+
+        bool operator==(const ResidualShardKey& other) const {
+            return tensor_id == other.tensor_id && shard_idx == other.shard_idx;
+        }
+    };
+
+    struct ResidualShardKeyHash {
+        size_t operator()(const ResidualShardKey& key) const {
+            size_t h1 = std::hash<int64_t>{}(key.tensor_id);
+            size_t h2 = std::hash<int64_t>{}(key.shard_idx);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+        }
+    };
+
       // Error-feedback residual cache (keyed by TensorImpl address).
       std::mutex residual_mutex_;
       std::unordered_map<int64_t, at::Tensor> residual_cache_;
+      std::unordered_map<ResidualShardKey, at::Tensor, ResidualShardKeyHash>
+          residual_cache_stage2_;
 };
 
 // 工厂函数，用于 Python 侧 register_backend
@@ -126,6 +158,7 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     int size,
       const std::chrono::milliseconds& timeout,
       int bitwidth,
-      bool error_feedback);
+    bool error_feedback,
+    const std::string& error_feedback_mode);
 
 }  // namespace bitscom

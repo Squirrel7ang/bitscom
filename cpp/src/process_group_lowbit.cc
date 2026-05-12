@@ -4,9 +4,59 @@
 #include <ATen/ATen.h>
 
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#include <algorithm>
+#include <cctype>
 #include <iostream>
 
 namespace bitscom {
+
+namespace {
+
+std::string toLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+ErrorFeedbackMode parseErrorFeedbackMode(const LowBitOptions& options) {
+    std::string mode = options.error_feedback_mode;
+    if (mode.empty() || mode == "auto") {
+        mode = options.error_feedback ? "legacy" : "none";
+    }
+    mode = toLower(mode);
+
+    if (mode == "none" || mode == "off" || mode == "disabled") {
+        return ErrorFeedbackMode::kDisabled;
+    }
+    if (mode == "legacy" || mode == "ef") {
+        return ErrorFeedbackMode::kLegacy;
+    }
+    if (mode == "ef21") {
+        return ErrorFeedbackMode::kEF21;
+    }
+    if (mode == "ef21+" || mode == "ef21_plus") {
+        return ErrorFeedbackMode::kEF21Plus;
+    }
+
+    TORCH_CHECK(false, "unsupported error_feedback_mode: ", options.error_feedback_mode);
+}
+
+const char* errorFeedbackModeName(ErrorFeedbackMode mode) {
+    switch (mode) {
+        case ErrorFeedbackMode::kDisabled:
+            return "none";
+        case ErrorFeedbackMode::kLegacy:
+            return "legacy";
+        case ErrorFeedbackMode::kEF21:
+            return "ef21";
+        case ErrorFeedbackMode::kEF21Plus:
+            return "ef21_plus";
+    }
+    return "none";
+}
+
+}  // namespace
 
 // ==================== WorkLowBit ====================
 
@@ -69,9 +119,13 @@ ProcessGroupLowBit::ProcessGroupLowBit(
     nccl_pg_ = c10::make_intrusive<c10d::ProcessGroupNCCL>(
         store, rank, size, std::move(nccl_options));
 
+    error_feedback_mode_ = parseErrorFeedbackMode(options_);
+
     std::cout << "[LowBit] ProcessGroupLowBit created: rank=" << rank
               << " size=" << size
-              << " bitwidth=" << options_.bitwidth << std::endl;
+              << " bitwidth=" << options_.bitwidth
+              << " error_feedback=" << errorFeedbackModeName(error_feedback_mode_)
+              << std::endl;
 }
 
 // ---- pack/unpack 占位实现 ----
@@ -150,6 +204,14 @@ bool ProcessGroupLowBit::shouldUseLowBitAllreduce(
         getSize() > 1;
 }
 
+bool ProcessGroupLowBit::useStage1ErrorFeedback() const {
+    return error_feedback_mode_ != ErrorFeedbackMode::kDisabled;
+}
+
+bool ProcessGroupLowBit::useStage2ErrorFeedback() const {
+    return error_feedback_mode_ == ErrorFeedbackMode::kEF21Plus;
+}
+
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     std::vector<at::Tensor>& tensors,
     const c10d::AllreduceOptions& opts) {
@@ -161,6 +223,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     struct TensorPipelineState {
         at::Tensor original;
         at::Tensor flat;
+        int64_t tensor_id = 0;
         int64_t shard_len = 0;
 
         std::vector<at::Tensor> send_packed;
@@ -173,6 +236,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     state->reserve(tensors.size());
 
     const int world_size = getSize();
+    const int rank = getRank();
+
+    const bool stage1_ef = useStage1ErrorFeedback();
+    const bool stage2_ef = useStage2ErrorFeedback();
 
     c10d::AllToAllOptions alltoall_opts;
     std::vector<c10::intrusive_ptr<c10d::Work>> phase1_works;
@@ -181,6 +248,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
         TensorPipelineState s;
         s.original = tensor;
         s.flat = tensor.contiguous().view(-1);
+        s.tensor_id = static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(s.original.unsafeGetTensorImpl()));
         auto corrected = s.flat.to(at::kFloat);
 
         TORCH_CHECK(
@@ -188,9 +257,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
             "lowbit allreduce requires tensor.numel() divisible by world_size, got numel=",
             s.flat.numel(), " world_size=", world_size);
 
-        if (options_.error_feedback) {
-            const int64_t key = static_cast<int64_t>(
-                reinterpret_cast<uintptr_t>(s.original.unsafeGetTensorImpl()));
+        if (stage1_ef) {
+            const int64_t key = s.tensor_id;
             at::Tensor residual;
             {
                 std::lock_guard<std::mutex> lock(residual_mutex_);
@@ -218,7 +286,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
         s.recv_scales.reserve(world_size);
 
         std::vector<at::Tensor> sent_fp_shards;
-        if (options_.error_feedback) {
+        if (stage1_ef) {
             sent_fp_shards.reserve(world_size);
         }
 
@@ -226,7 +294,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
             at::Tensor packed, scale;
             std::tie(packed, scale) = pack(shard);
 
-            if (options_.error_feedback) {
+            if (stage1_ef) {
                 auto approx = unpack(
                     packed,
                     s.shard_len,
@@ -242,9 +310,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
             s.recv_scales.push_back(at::empty_like(scale));
         }
 
-        if (options_.error_feedback) {
-            const int64_t key = static_cast<int64_t>(
-                reinterpret_cast<uintptr_t>(s.original.unsafeGetTensorImpl()));
+        if (stage1_ef) {
+            const int64_t key = s.tensor_id;
             auto sent_approx = at::cat(sent_fp_shards, 0);
             auto new_residual = (corrected - sent_approx).contiguous();
             std::lock_guard<std::mutex> lock(residual_mutex_);
@@ -258,7 +325,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     }
 
     auto anchor = phase1_works[0];
-    auto post_hook = [this, state, phase1_works, world_size]() mutable -> bool {
+    auto post_hook = [this, state, phase1_works, world_size, rank, stage2_ef]() mutable -> bool {
         for (auto& w : phase1_works) {
             if (!w->wait()) {
                 return false;
@@ -279,8 +346,43 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
                 local_sum.add_(fp);
             }
 
+            at::Tensor reduce_input = local_sum;
+            if (stage2_ef) {
+                // EF21+: keep a residual on the reduced shard quantization step.
+                ResidualShardKey key{s.tensor_id, static_cast<int64_t>(rank)};
+                at::Tensor residual;
+                {
+                    std::lock_guard<std::mutex> lock(residual_mutex_);
+                    auto it = residual_cache_stage2_.find(key);
+                    if (it != residual_cache_stage2_.end()) {
+                        residual = it->second;
+                    }
+                }
+
+                if (!residual.defined() ||
+                    residual.numel() != local_sum.numel() ||
+                    residual.device() != local_sum.device() ||
+                    residual.scalar_type() != at::kFloat) {
+                    residual = at::zeros_like(local_sum);
+                }
+                reduce_input = local_sum + residual;
+            }
+
             at::Tensor reduced_packed, reduced_scale;
-            std::tie(reduced_packed, reduced_scale) = pack(local_sum);
+            std::tie(reduced_packed, reduced_scale) = pack(reduce_input);
+
+            if (stage2_ef) {
+                auto approx = unpack(
+                    reduced_packed,
+                    s.shard_len,
+                    reduced_scale,
+                    s.flat.device(),
+                    at::kFloat);
+                auto new_residual = (reduce_input - approx).contiguous();
+                ResidualShardKey key{s.tensor_id, static_cast<int64_t>(rank)};
+                std::lock_guard<std::mutex> lock(residual_mutex_);
+                residual_cache_stage2_[key] = new_residual;
+            }
 
             std::vector<std::vector<at::Tensor>> gathered_packed(1);
             gathered_packed[0].reserve(world_size);
@@ -401,12 +503,14 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     int size,
     const std::chrono::milliseconds& timeout,
     int bitwidth,
-    bool error_feedback) {
+    bool error_feedback,
+    const std::string& error_feedback_mode) {
 
     LowBitOptions opts;
     opts.timeout = timeout;
     opts.bitwidth = bitwidth;
     opts.error_feedback = error_feedback;
+    opts.error_feedback_mode = error_feedback_mode;
     return c10::make_intrusive<ProcessGroupLowBit>(
         store, rank, size, std::move(opts));
 }
