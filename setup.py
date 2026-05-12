@@ -27,11 +27,27 @@ def _existing(path):
     return os.path.isdir(path)
 
 
+def _use_nvidia_cuda_headers(cuda_home):
+    return not (cuda_home and os.path.abspath(cuda_home) == "/usr/local/corex-4.4.0")
+
+
 def _collect_include_dirs():
     include_dirs = [
         _PROJECT_ROOT,
         os.path.join(_PROJECT_ROOT, "cpp", "include"),
     ]
+
+    cuda_home = os.environ.get("CUDA_HOME")
+    if not cuda_home and os.path.isdir("/usr/local/corex-4.4.0"):
+        cuda_home = "/usr/local/corex-4.4.0"
+    if not cuda_home:
+        cuda_home = "/usr/local/cuda"
+
+    sys_cuda_candidates = [
+        os.path.join(cuda_home, "include"),
+        os.path.join(cuda_home, "targets", "x86_64-linux", "include"),
+    ]
+    include_dirs.extend([p for p in sys_cuda_candidates if _existing(p)])
 
     env_include = os.environ.get("NCCL_INCLUDE_DIR")
     if env_include:
@@ -40,11 +56,32 @@ def _collect_include_dirs():
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
         candidates = [
-            os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "cu13", "include"),
-            os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "cuda_runtime", "include"),
             os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "nccl", "include"),
             os.path.join(conda_prefix, "include"),
         ]
+        if _use_nvidia_cuda_headers(cuda_home):
+            candidates.extend(
+                [
+                    os.path.join(
+                        conda_prefix,
+                        "lib",
+                        "python3.12",
+                        "site-packages",
+                        "nvidia",
+                        "cu13",
+                        "include",
+                    ),
+                    os.path.join(
+                        conda_prefix,
+                        "lib",
+                        "python3.12",
+                        "site-packages",
+                        "nvidia",
+                        "cuda_runtime",
+                        "include",
+                    ),
+                ]
+            )
         include_dirs.extend([p for p in candidates if _existing(p)])
 
     # Probe active Python site-packages to find pip/conda-provided CUDA/NCCL headers.
@@ -61,24 +98,24 @@ def _collect_include_dirs():
     site_roots.append(os.path.dirname(torch.__file__))
 
     nvidia_include_suffixes = [
-        os.path.join("nvidia", "cu13", "include"),
-        os.path.join("nvidia", "cuda_runtime", "include"),
         os.path.join("nvidia", "nccl", "include"),
-        os.path.join("nvidia", "cublas", "include"),
-        os.path.join("nvidia", "curand", "include"),
     ]
+    if _use_nvidia_cuda_headers(cuda_home):
+        nvidia_include_suffixes.extend(
+            [
+                os.path.join("nvidia", "cu13", "include"),
+                os.path.join("nvidia", "cuda_runtime", "include"),
+                os.path.join("nvidia", "cublas", "include"),
+                os.path.join("nvidia", "curand", "include"),
+            ]
+        )
     for root in site_roots:
         for suffix in nvidia_include_suffixes:
             candidate = os.path.join(root, suffix)
             if _existing(candidate):
                 include_dirs.append(candidate)
 
-    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-    sys_cuda_candidates = [
-        os.path.join(cuda_home, "include"),
-        os.path.join(cuda_home, "targets", "x86_64-linux", "include"),
-    ]
-    include_dirs.extend([p for p in sys_cuda_candidates if _existing(p)])
+    # CUDA_HOME already applied above to prioritize toolkit headers over conda ones.
 
     # De-duplicate while preserving order.
     seen = set()
@@ -134,11 +171,29 @@ def _collect_library_dirs():
     return uniq
 
 
+def _cuda_compiler_from_env():
+    return (
+        os.environ.get("BITSCOM_CUDA_COMPILER")
+        or os.environ.get("CUDA_NVCC_EXECUTABLE")
+        or os.environ.get("NVCC")
+    )
+
+
 def _has_nvcc():
+    compiler = _cuda_compiler_from_env()
+    if compiler:
+        return shutil.which(compiler) is not None or os.path.exists(compiler)
     if shutil.which("nvcc"):
         return True
     cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
     return os.path.exists(os.path.join(cuda_home, "bin", "nvcc"))
+
+
+def _maybe_set_cuda_nvcc():
+    compiler = os.environ.get("BITSCOM_CUDA_COMPILER")
+    if compiler and not os.environ.get("CUDA_NVCC_EXECUTABLE"):
+        # Let PyTorch extension build treat this compiler as nvcc.
+        os.environ["CUDA_NVCC_EXECUTABLE"] = compiler
 
 
 class BuildExtensionWithCompileCommands(BuildExtension):
@@ -196,6 +251,8 @@ class BuildExtensionWithCompileCommands(BuildExtension):
                 json.dump(list(by_file.values()), f, indent=2)
 
 
+_maybe_set_cuda_nvcc()
+
 ext_modules = [
     CppExtension(
         name="bitscom._lowbit_c",
@@ -248,6 +305,6 @@ setup(
     cmdclass={"build_ext": BuildExtensionWithCompileCommands},
     python_requires=">=3.8",
     install_requires=[
-        "torch>=2.0",
+        # "torch>=2.0",
     ],
 )
