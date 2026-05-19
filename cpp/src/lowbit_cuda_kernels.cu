@@ -4,6 +4,7 @@
 #include <torch/extension.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
@@ -129,6 +130,123 @@ __global__ void unpack_lowbit_kernel(
     int lane = idx % per_byte;
     int raw = (packed[byte_idx] >> (lane * bitwidth)) & mask;
     q[idx] = static_cast<int16_t>(raw + qmin);
+}
+
+__device__ inline float sr_uniform(uint64_t seed, int64_t idx) {
+    uint64_t x = seed ^ (static_cast<uint64_t>(idx) + 0x9e3779b97f4a7c15ULL);
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    uint32_t r = static_cast<uint32_t>((x * 0x2545F4914F6CDD1DULL) >> 32);
+    return static_cast<float>(r) / 4294967296.0f;
+}
+
+template <typename scalar_t>
+__global__ void blockwise_quantize_pack_kernel(
+    const scalar_t* input,
+    uint8_t* packed,
+    at::Half* scales,
+    int64_t numel,
+    int bitwidth,
+    int block_size,
+    int qmin,
+    int qmax,
+    int per_byte,
+    bool stochastic_rounding,
+    uint64_t seed) {
+    extern __shared__ float shared_max[];
+
+    int block_idx = blockIdx.x;
+    int64_t block_start = static_cast<int64_t>(block_idx) * block_size;
+    int64_t block_end = block_start + static_cast<int64_t>(block_size);
+    if (block_end > numel) {
+        block_end = numel;
+    }
+
+    float local_max = 0.0f;
+    for (int64_t idx = block_start + threadIdx.x; idx < block_end; idx += blockDim.x) {
+        float v = static_cast<float>(input[idx]);
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+
+    shared_max[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_max[threadIdx.x] = fmaxf(shared_max[threadIdx.x], shared_max[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    float max_abs = shared_max[0];
+    float scale = (max_abs > 0.0f) ? (max_abs / static_cast<float>(qmax)) : 1.0f;
+    if (threadIdx.x == 0) {
+        scales[block_idx] = static_cast<at::Half>(scale);
+    }
+    __syncthreads();
+
+    float scale_for_norm = static_cast<float>(static_cast<at::Half>(scale));
+    int mask = (1 << bitwidth) - 1;
+    int64_t byte_start = block_start / per_byte;
+    int64_t bytes_in_block = ((block_end - block_start) + per_byte - 1) / per_byte;
+
+    for (int64_t local_byte = threadIdx.x; local_byte < bytes_in_block; local_byte += blockDim.x) {
+        int64_t elem_base = block_start + local_byte * per_byte;
+        uint8_t out = 0;
+        for (int lane = 0; lane < per_byte; ++lane) {
+            int64_t elem = elem_base + lane;
+            int q = 0;
+            if (elem < block_end) {
+                float v = static_cast<float>(input[elem]);
+                float norm = fabsf(v) / scale_for_norm;
+                float mag;
+                if (stochastic_rounding) {
+                    float lower = floorf(norm);
+                    float p = fminf(fmaxf(norm - lower, 0.0f), 1.0f);
+                    mag = lower + ((sr_uniform(seed, elem) < p) ? 1.0f : 0.0f);
+                } else {
+                    mag = nearbyintf(norm);
+                }
+                float signed_v = (bitwidth == 1) ? mag : (mag * ((v > 0.0f) - (v < 0.0f)));
+                signed_v = fminf(fmaxf(signed_v, static_cast<float>(qmin)), static_cast<float>(qmax));
+                q = static_cast<int>(signed_v) - qmin;
+                if (q < 0) {
+                    q = 0;
+                }
+                if (q > mask) {
+                    q = mask;
+                }
+            }
+            out |= static_cast<uint8_t>((q & mask) << (lane * bitwidth));
+        }
+        packed[byte_start + local_byte] = out;
+    }
+}
+
+template <typename scalar_t>
+__global__ void blockwise_unpack_dequantize_kernel(
+    const uint8_t* packed,
+    const at::Half* scales,
+    scalar_t* output,
+    int64_t numel,
+    int bitwidth,
+    int block_size,
+    int qmin,
+    int per_byte) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= numel) {
+        return;
+    }
+
+    int64_t byte_idx = idx / per_byte;
+    int lane = idx % per_byte;
+    int mask = (1 << bitwidth) - 1;
+    int raw = (packed[byte_idx] >> (lane * bitwidth)) & mask;
+    int q = raw + qmin;
+    int64_t block_idx = idx / block_size;
+    float scale = static_cast<float>(scales[block_idx]);
+    output[idx] = static_cast<scalar_t>(static_cast<float>(q) * scale);
 }
 
 }  // namespace
@@ -261,6 +379,122 @@ at::Tensor unpack_lowbit_cuda(
         static_cast<int>(bitwidth),
         qmin);
     check_cuda(cudaGetLastError(), "unpack_lowbit_kernel launch failed");
+
+    return out;
+}
+
+std::tuple<at::Tensor, at::Tensor, int64_t> blockwise_quantize_pack_cuda(
+    const at::Tensor& input,
+    int64_t bitwidth,
+    int64_t block_size,
+    bool stochastic_rounding) {
+    TORCH_CHECK(input.is_cuda(), "blockwise_quantize_pack_cuda expects CUDA tensor");
+    TORCH_CHECK(input.is_floating_point(), "blockwise_quantize_pack_cuda expects floating tensor");
+    TORCH_CHECK(input.scalar_type() == at::kFloat || input.scalar_type() == at::kHalf,
+                "blockwise_quantize_pack_cuda supports float32/float16 tensors");
+    TORCH_CHECK(bitwidth == 1 || bitwidth == 2 || bitwidth == 4 || bitwidth == 8,
+                "CUDA fused blockwise packing currently supports 1/2/4/8 bit");
+    TORCH_CHECK(block_size > 0, "block_size must be > 0");
+
+    int bw = static_cast<int>(bitwidth);
+    int bs = static_cast<int>(block_size);
+    int per_byte = 8 / bw;
+    TORCH_CHECK(bs % per_byte == 0,
+                "CUDA fused blockwise packing requires block_size divisible by values per packed byte");
+
+    auto flat = input.contiguous().view(-1);
+    int64_t numel = flat.numel();
+    int64_t num_blocks = (numel + bs - 1) / bs;
+    int64_t num_bytes = (numel + per_byte - 1) / per_byte;
+    auto packed = at::empty({num_bytes}, flat.options().dtype(at::kByte));
+    auto scales = at::empty({num_blocks}, flat.options().dtype(at::kHalf));
+    if (numel == 0) {
+        return {packed, scales, numel};
+    }
+
+    auto bounds = quant_bounds(bw);
+    int qmin = bounds.first;
+    int qmax = bounds.second;
+    int threads = 256;
+    auto stream = at::cuda::getDefaultCUDAStream().stream();
+
+    uint64_t seed = static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    seed ^= static_cast<uint64_t>(reinterpret_cast<uintptr_t>(flat.data_ptr()));
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(flat.scalar_type(), "blockwise_quantize_pack_cuda", [&] {
+        blockwise_quantize_pack_kernel<scalar_t><<<
+            static_cast<int>(num_blocks),
+            threads,
+            threads * sizeof(float),
+            stream>>>(
+            flat.data_ptr<scalar_t>(),
+            packed.data_ptr<uint8_t>(),
+            scales.data_ptr<at::Half>(),
+            numel,
+            bw,
+            bs,
+            qmin,
+            qmax,
+            per_byte,
+            stochastic_rounding,
+            seed);
+    });
+    check_cuda(cudaGetLastError(), "blockwise_quantize_pack_kernel launch failed");
+
+    return {packed, scales, numel};
+}
+
+at::Tensor blockwise_unpack_dequantize_cuda(
+    const at::Tensor& packed,
+    const at::Tensor& scales,
+    int64_t bitwidth,
+    int64_t numel,
+    int64_t block_size,
+    at::ScalarType dtype) {
+    TORCH_CHECK(packed.is_cuda(), "blockwise_unpack_dequantize_cuda expects CUDA packed tensor");
+    TORCH_CHECK(scales.is_cuda(), "blockwise_unpack_dequantize_cuda expects CUDA scales tensor");
+    TORCH_CHECK(packed.scalar_type() == at::kByte,
+                "blockwise_unpack_dequantize_cuda expects uint8 packed tensor");
+    TORCH_CHECK(scales.scalar_type() == at::kHalf,
+                "blockwise_unpack_dequantize_cuda expects float16 scales tensor");
+    TORCH_CHECK(dtype == at::kFloat || dtype == at::kHalf,
+                "blockwise_unpack_dequantize_cuda supports float32/float16 output");
+    TORCH_CHECK(bitwidth == 1 || bitwidth == 2 || bitwidth == 4 || bitwidth == 8,
+                "CUDA fused blockwise unpacking currently supports 1/2/4/8 bit");
+    TORCH_CHECK(block_size > 0, "block_size must be > 0");
+
+    int bw = static_cast<int>(bitwidth);
+    int bs = static_cast<int>(block_size);
+    int per_byte = 8 / bw;
+    TORCH_CHECK(bs % per_byte == 0,
+                "CUDA fused blockwise unpacking requires block_size divisible by values per packed byte");
+
+    auto out = at::empty({numel}, packed.options().dtype(dtype));
+    if (numel == 0) {
+        return out;
+    }
+
+    auto bounds = quant_bounds(bw);
+    int qmin = bounds.first;
+    int threads = 256;
+    int blocks = static_cast<int>((numel + threads - 1) / threads);
+    auto stream = at::cuda::getDefaultCUDAStream().stream();
+    auto packed_contig = packed.contiguous();
+    auto scales_contig = scales.contiguous();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(out.scalar_type(), "blockwise_unpack_dequantize_cuda", [&] {
+        blockwise_unpack_dequantize_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            packed_contig.data_ptr<uint8_t>(),
+            scales_contig.data_ptr<at::Half>(),
+            out.data_ptr<scalar_t>(),
+            numel,
+            bw,
+            bs,
+            qmin,
+            per_byte);
+    });
+    check_cuda(cudaGetLastError(), "blockwise_unpack_dequantize_kernel launch failed");
 
     return out;
 }
