@@ -156,7 +156,8 @@ def _run_case(case: dict) -> None:
             join=True,
         )
 
-    ok, payload = queue.get_nowait()
+    # ok, payload = queue.get_nowait()
+    ok, payload = queue.get()
     assert ok, payload
 
     max_err, mean_err = payload["errs"]

@@ -315,7 +315,9 @@ class LowBitGroup:
                 # only the inter-node stage is compressed.
                 # Local communication is high-bandwidth: keep it full precision.
                 # print(f"[Global Rank {global_rank}] Starting local all-reduce for chunk {idx} with numel {chunk.numel()}")
-                dist.reduce(chunk, dst=dist.get_rank() - dist.get_rank() % local_size, group=local_group, op=dist.ReduceOp.SUM)
+                # dist.reduce(chunk, dst=dist.get_rank() - dist.get_rank() % local_size, group=local_group, op=dist.ReduceOp.SUM)
+                dist.reduce(chunk, dst=0, group=local_group, op=dist.ReduceOp.SUM)
+                
                 # dist.all_reduce(chunk, group=local_group, op=dist.ReduceOp.SUM)
                 # print(f"[Global Rank {global_rank}] Finished local all-reduce for chunk {idx}")
                 return
@@ -374,7 +376,8 @@ class LowBitGroup:
                     bcast_buffers[idx] = torch.empty_like(chunk)
 
                 # print(f"[Global Rank {global_rank}] Broadcasting inter-node result for chunk {idx} with numel {chunk.numel()}")
-                dist.broadcast(bcast_buffers[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
+                # dist.broadcast(bcast_buffers[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
+                dist.broadcast(bcast_buffers[idx], src=0, group=local_group)
                 chunk.copy_(bcast_buffers[idx])
                 return
 
@@ -392,8 +395,10 @@ class LowBitGroup:
                 packed_bcasts[idx] = torch.empty_like(packed_templates[idx])
                 bcast_scale_tensors[idx] = torch.empty_like(scale_templates[idx])
 
-            dist.broadcast(packed_bcasts[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
-            dist.broadcast(bcast_scale_tensors[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
+            # dist.broadcast(packed_bcasts[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
+            # dist.broadcast(bcast_scale_tensors[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
+            dist.broadcast(packed_bcasts[idx], src=0, group=local_group)
+            dist.broadcast(bcast_scale_tensors[idx], src=0, group=local_group)
 
             q_recv = unpack_lowbit(packed_bcasts[idx], self.bitwidth, numels[idx])
             fp_recv = dequantize_tensor_blockwise(

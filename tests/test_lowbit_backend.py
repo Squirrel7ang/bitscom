@@ -35,6 +35,7 @@ def test_register_lowbit_backend_idempotent(monkeypatch):
     monkeypatch.setattr(lb, "_REGISTERED", True)
     monkeypatch.setattr(lb, "_BACKEND_BITWIDTH", 4)
     monkeypatch.setattr(lb, "_BACKEND_ERROR_FEEDBACK", False)
+    monkeypatch.setattr(lb, "_BACKEND_ERROR_FEEDBACK_MODE", "none")
     monkeypatch.setattr(lb, "_BACKEND_BLOCK_SIZE", 256)
     monkeypatch.setattr(lb, "_BACKEND_STAGE2_ERROR_FEEDBACK", False)
 
@@ -53,6 +54,7 @@ def test_register_lowbit_backend_rejects_conflicting_options(monkeypatch):
     monkeypatch.setattr(lb, "_REGISTERED", True)
     monkeypatch.setattr(lb, "_BACKEND_BITWIDTH", 4)
     monkeypatch.setattr(lb, "_BACKEND_ERROR_FEEDBACK", False)
+    monkeypatch.setattr(lb, "_BACKEND_ERROR_FEEDBACK_MODE", "none")
     monkeypatch.setattr(lb, "_BACKEND_BLOCK_SIZE", 256)
     monkeypatch.setattr(lb, "_BACKEND_STAGE2_ERROR_FEEDBACK", False)
 

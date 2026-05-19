@@ -136,11 +136,11 @@ def register_lowbit_backend(
         ):
             raise RuntimeError(
                 "lowbit backend is already registered with different options: "
-                f"bitwidth={_BACKEND_BITWIDTH}, "
-                f"error_feedback={_BACKEND_ERROR_FEEDBACK}, "
-                f"error_feedback_mode={_BACKEND_ERROR_FEEDBACK_MODE}, "
-                f"block_size={_BACKEND_BLOCK_SIZE}, "
-                f"stage2_error_feedback={_BACKEND_STAGE2_ERROR_FEEDBACK}"
+                f"bitwidth={_BACKEND_BITWIDTH}, you specified bitwidth={bitwidth}, "
+                f"error_feedback={_BACKEND_ERROR_FEEDBACK}, you specified error_feedback={error_feedback}, "
+                f"error_feedback_mode={_BACKEND_ERROR_FEEDBACK_MODE}, you specified error_feedback_mode={error_feedback_mode}, "
+                f"block_size={_BACKEND_BLOCK_SIZE}, you specified block_size={block_size}, "
+                f"stage2_error_feedback={_BACKEND_STAGE2_ERROR_FEEDBACK}, you specified stage2_error_feedback={resolved_stage2}"
             )
         return
 
