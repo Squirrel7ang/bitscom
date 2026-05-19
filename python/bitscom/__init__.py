@@ -18,7 +18,7 @@ bitscom: Low-bit distributed communication primitives for PyTorch.
 
 from .lowbit_backend import register_lowbit_backend, is_extension_available
 from .api import LowBitGroup
-from .quantization import SUPPORTED_BITWIDTHS
+from .quantization import DEFAULT_BLOCK_SIZE, SUPPORTED_BITWIDTHS
 
 __all__ = [
     "register_lowbit_backend",
@@ -35,6 +35,8 @@ def init(
     bitwidth: int = 4,
     error_feedback: bool = False,
     error_feedback_mode: str | None = None,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    stage2_error_feedback: bool | None = None,
 ):
     """
     初始化 bitscom：注册 lowbit backend。
@@ -44,4 +46,6 @@ def init(
         bitwidth=bitwidth,
         error_feedback=error_feedback,
         error_feedback_mode=error_feedback_mode,
+        block_size=block_size,
+        stage2_error_feedback=stage2_error_feedback,
     )

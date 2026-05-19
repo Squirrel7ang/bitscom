@@ -8,7 +8,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import bitscom
-from bitscom.quantization import dequantize_tensor, pack_lowbit, quantize_tensor, unpack_lowbit
+from bitscom.quantization import (
+    DEFAULT_BLOCK_SIZE,
+    dequantize_tensor_blockwise,
+    pack_lowbit,
+    quantize_tensor_blockwise,
+    unpack_lowbit,
+)
 
 
 pytestmark = pytest.mark.integration
@@ -49,6 +55,7 @@ def _make_inputs(rank: int, world_size: int, case: dict, device: torch.device) -
 def _simulate_lowbit_reduce_scatter_cpu(
     inputs_by_rank: list[list[torch.Tensor]],
     bitwidth: int,
+    block_size: int = DEFAULT_BLOCK_SIZE,
 ) -> list[torch.Tensor]:
     world_size = len(inputs_by_rank)
     if world_size == 0:
@@ -65,12 +72,18 @@ def _simulate_lowbit_reduce_scatter_cpu(
         local_sum = torch.zeros(numel, dtype=torch.float32)
         for src_rank in range(world_size):
             shard = inputs_by_rank[src_rank][shard_idx]
-            q, scale = quantize_tensor(shard, bitwidth=bitwidth, stochastic_rounding=False)
+            q, scales = quantize_tensor_blockwise(
+                shard,
+                bitwidth=bitwidth,
+                block_size=block_size,
+                stochastic_rounding=False,
+            )
             packed, _ = pack_lowbit(q, bitwidth)
             q_unpacked = unpack_lowbit(packed, bitwidth, numel)
-            fp_part = dequantize_tensor(
+            fp_part = dequantize_tensor_blockwise(
                 q_unpacked,
-                scale,
+                scales,
+                block_size=block_size,
                 dtype=torch.float32,
                 device=torch.device("cpu"),
             )

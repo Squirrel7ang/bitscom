@@ -28,12 +28,13 @@ Current architecture:
 - Stochastic rounding support in quantization (CPU + CUDA)
 - `LowBitGroup.compress()` and `LowBitGroup.decompress()` helper APIs
 - Optional simulation mode (`simulate_quantization=True`) for validating quantization effect before collectives
+- Blockwise quantization with per-block FP16 scales for low-bit all-reduce
 - Python low-bit all-reduce pipeline for `<8bit` (`all-to-all -> local reduce -> all-gather`)
 - Hierarchical pipeline-A low-bit all-reduce (`local reduce -> inter lowbit all-reduce -> local broadcast`)
 - Multi-node CUDA dual-stream scheduling for pipeline-A (`warmup -> steady -> cooldown`)
 - Single-node local-group-only fast path: one-shot full-precision all-reduce without chunked pipeline
 - Error-feedback in first-stage quantization for C++ backend low-bit allreduce path
-- Explicit backend option registration: `bitwidth` and `error_feedback`
+- Explicit backend option registration: `bitwidth`, `error_feedback`, `block_size`, `stage2_error_feedback`
 - Robust backend registration with explicit error when C++ extension is missing
 - Build-time `compile_commands.json` emission for clangd
 

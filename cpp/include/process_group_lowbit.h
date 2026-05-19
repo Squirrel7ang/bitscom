@@ -21,6 +21,8 @@ struct LowBitOptions {
     int bitwidth = 4;
     bool error_feedback = false;
     std::string error_feedback_mode = "auto";
+    int block_size = 256;
+    bool stage2_error_feedback = true;
     std::chrono::milliseconds timeout = std::chrono::milliseconds(600000);
 };
 
@@ -156,9 +158,11 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     const c10::intrusive_ptr<c10d::Store>& store,
     int rank,
     int size,
-      const std::chrono::milliseconds& timeout,
-      int bitwidth,
+    const std::chrono::milliseconds& timeout,
+    int bitwidth,
     bool error_feedback,
-    const std::string& error_feedback_mode);
+    const std::string& error_feedback_mode,
+    int block_size,
+    bool stage2_error_feedback);
 
 }  // namespace bitscom
