@@ -9,6 +9,8 @@ import torch
 
 try:
     from bitscom._lowbit_cuda import (
+        blockwise_quantize_pack_cuda,
+        blockwise_unpack_dequantize_cuda,
         dequantize_cuda,
         pack_lowbit_cuda,
         quantize_cuda,
@@ -17,6 +19,8 @@ try:
 
     _HAS_CUDA_KERNELS = True
 except Exception:  # pragma: no cover - depends on extension build environment
+    blockwise_quantize_pack_cuda = None
+    blockwise_unpack_dequantize_cuda = None
     dequantize_cuda = None
     pack_lowbit_cuda = None
     quantize_cuda = None
@@ -146,6 +150,47 @@ def quantize_tensor_blockwise(
     return q, scale_half
 
 
+def quantize_pack_tensor_blockwise(
+    tensor: torch.Tensor,
+    bitwidth: int,
+    *,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    stochastic_rounding: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Blockwise quantize and pack, using a fused CUDA path when available."""
+
+    validate_bitwidth(bitwidth)
+    if not tensor.is_floating_point():
+        raise TypeError("quantize_pack_tensor_blockwise expects a floating-point tensor")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}")
+
+    if (
+        tensor.is_cuda
+        and _HAS_CUDA_KERNELS
+        and blockwise_quantize_pack_cuda is not None
+        and bitwidth in (1, 2, 4, 8)
+        and block_size % (8 // bitwidth) == 0
+        and tensor.dtype in (torch.float16, torch.float32)
+    ):
+        packed, scales, numel = blockwise_quantize_pack_cuda(
+            tensor,
+            bitwidth,
+            block_size,
+            stochastic_rounding,
+        )
+        return packed, scales, int(numel)
+
+    q, scales = quantize_tensor_blockwise(
+        tensor,
+        bitwidth,
+        block_size=block_size,
+        stochastic_rounding=stochastic_rounding,
+    )
+    packed, numel = pack_lowbit(q, bitwidth)
+    return packed, scales, numel
+
+
 def dequantize_tensor_blockwise(
     q_tensor: torch.Tensor,
     scales: torch.Tensor,
@@ -190,6 +235,58 @@ def dequantize_tensor_blockwise(
     return out.to(device=device, dtype=dtype)
 
 
+def unpack_dequantize_tensor_blockwise(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    bitwidth: int,
+    numel: int,
+    *,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+    shape: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Unpack and blockwise dequantize, using a fused CUDA path when available."""
+
+    validate_bitwidth(bitwidth)
+    if device is None:
+        device = packed.device
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}")
+
+    if (
+        packed.is_cuda
+        and scales.is_cuda
+        and _HAS_CUDA_KERNELS
+        and blockwise_unpack_dequantize_cuda is not None
+        and bitwidth in (1, 2, 4, 8)
+        and block_size % (8 // bitwidth) == 0
+        and dtype in (torch.float16, torch.float32)
+    ):
+        out = blockwise_unpack_dequantize_cuda(
+            packed,
+            scales,
+            bitwidth,
+            numel,
+            block_size,
+            dtype,
+        )
+        if shape is not None:
+            out = out.view(*shape)
+        return out.to(device=device, dtype=dtype)
+
+    q = unpack_lowbit(packed, bitwidth, numel)
+    out = dequantize_tensor_blockwise(
+        q,
+        scales,
+        block_size=block_size,
+        dtype=dtype,
+        device=device,
+        shape=shape,
+    )
+    return out
+
+
 def dequantize_tensor(
     q_tensor: torch.Tensor,
     scale: float,
@@ -215,14 +312,15 @@ def pack_lowbit(q_tensor: torch.Tensor, bitwidth: int) -> Tuple[torch.Tensor, in
     """Pack signed quantized values to a contiguous uint8 tensor."""
 
     validate_bitwidth(bitwidth)
-    qmin, _ = _quant_bounds(bitwidth)
-    values = (q_tensor.to(torch.int32).contiguous().view(-1) - qmin).to(torch.int32)
-    numel = int(values.numel())
-
     if q_tensor.is_cuda and _HAS_CUDA_KERNELS and bitwidth in (1, 2, 4, 8):
         # The CUDA fast path only covers bitwidths that map cleanly to byte
         # packing, which keeps the kernel interface compact.
+        numel = int(q_tensor.numel())
         return pack_lowbit_cuda(q_tensor, bitwidth), numel
+
+    qmin, _ = _quant_bounds(bitwidth)
+    values = (q_tensor.to(torch.int32).contiguous().view(-1) - qmin).to(torch.int32)
+    numel = int(values.numel())
 
     if bitwidth in (1, 2, 4, 8):
         # For these bitwidths, bit-shift packing is enough and keeps the Python

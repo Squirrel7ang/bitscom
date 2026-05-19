@@ -8,8 +8,10 @@ from bitscom.quantization import (
     compress_tensor,
     decompress_tensor,
     pack_lowbit,
+    quantize_pack_tensor_blockwise,
     quantize_tensor,
     roundtrip_tensor,
+    unpack_dequantize_tensor_blockwise,
     unpack_lowbit,
     validate_bitwidth,
 )
@@ -65,6 +67,31 @@ def test_compress_decompress_dtype_override():
     assert compressed.packed.dtype == torch.uint8
 
 
+@pytest.mark.parametrize("bitwidth", [2, 4, 8])
+def test_blockwise_quantize_pack_roundtrip_cpu(bitwidth):
+    x = torch.linspace(-3.0, 3.0, steps=4097, dtype=torch.float32)
+
+    packed, scales, numel = quantize_pack_tensor_blockwise(
+        x,
+        bitwidth=bitwidth,
+        block_size=256,
+    )
+    y = unpack_dequantize_tensor_blockwise(
+        packed,
+        scales,
+        bitwidth=bitwidth,
+        numel=numel,
+        block_size=256,
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+    assert packed.dtype == torch.uint8
+    assert scales.dtype == torch.float16
+    assert y.shape == x.shape
+    assert torch.max(torch.abs(y - x)).item() <= float(scales.max().item()) + 1e-6
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not _HAS_CUDA_KERNELS,
     reason="CUDA quantization extension is not available",
@@ -94,6 +121,36 @@ def test_pack_unpack_cuda_roundtrip_for_2bit():
     assert packed.is_cuda
     assert restored_q.is_cuda
     assert torch.equal(restored_q, q)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_CUDA_KERNELS,
+    reason="CUDA quantization extension is not available",
+)
+@pytest.mark.parametrize("bitwidth", [2, 4, 8])
+def test_blockwise_quantize_pack_cuda_roundtrip(bitwidth):
+    x = torch.linspace(-3.0, 3.0, steps=4097, device="cuda", dtype=torch.float32)
+
+    packed, scales, numel = quantize_pack_tensor_blockwise(
+        x,
+        bitwidth=bitwidth,
+        block_size=256,
+    )
+    y = unpack_dequantize_tensor_blockwise(
+        packed,
+        scales,
+        bitwidth=bitwidth,
+        numel=numel,
+        block_size=256,
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+    assert packed.is_cuda
+    assert scales.is_cuda
+    assert y.is_cuda
+    assert y.shape == x.shape
+    assert torch.max(torch.abs(y - x)).item() <= float(scales.max().item()) + 1e-6
 
 
 def test_stochastic_rounding_cpu_is_statistically_unbiased():

@@ -11,12 +11,10 @@ from .quantization import (
     SUPPORTED_BITWIDTHS,
     CompressedTensor,
     compress_tensor,
-    dequantize_tensor_blockwise,
     decompress_tensor,
-    pack_lowbit,
-    quantize_tensor_blockwise,
+    quantize_pack_tensor_blockwise,
     roundtrip_tensor,
-    unpack_lowbit,
+    unpack_dequantize_tensor_blockwise,
 )
 
 
@@ -207,13 +205,13 @@ class LowBitGroup:
         send_packed = []
         send_scales = []
         for shard in shards:
-            q_shard, scales = quantize_tensor_blockwise(
+            packed, scales, _ = quantize_pack_tensor_blockwise(
                 shard,
                 self.bitwidth,
                 block_size=self.block_size,
                 stochastic_rounding=self.stochastic_rounding,
             )
-            send_packed.append(pack_lowbit(q_shard, self.bitwidth)[0])
+            send_packed.append(packed)
             send_scales.append(scales)
 
         recv_packed = [torch.empty_like(send_packed[0]) for _ in range(world_size)]
@@ -224,23 +222,23 @@ class LowBitGroup:
 
         local_sum = torch.zeros(shard_len, dtype=torch.float32, device=flat.device)
         for src_rank in range(world_size):
-            q_part = unpack_lowbit(recv_packed[src_rank], self.bitwidth, shard_len)
-            fp_part = dequantize_tensor_blockwise(
-                q_part,
+            fp_part = unpack_dequantize_tensor_blockwise(
+                recv_packed[src_rank],
                 recv_scales[src_rank],
+                self.bitwidth,
+                shard_len,
                 block_size=self.block_size,
                 dtype=torch.float32,
                 device=flat.device,
             )
             local_sum.add_(fp_part)
 
-        q_reduced, reduced_scales = quantize_tensor_blockwise(
+        packed_reduced, reduced_scales, _ = quantize_pack_tensor_blockwise(
             local_sum,
             self.bitwidth,
             block_size=self.block_size,
             stochastic_rounding=self.stochastic_rounding,
         )
-        packed_reduced, _ = pack_lowbit(q_reduced, self.bitwidth)
 
         gathered_packed = [torch.empty_like(packed_reduced) for _ in range(world_size)]
         dist.all_gather(gathered_packed, packed_reduced, group=group)
@@ -252,10 +250,11 @@ class LowBitGroup:
 
         out_shards = []
         for rank_idx in range(world_size):
-            q_shard = unpack_lowbit(gathered_packed[rank_idx], self.bitwidth, shard_len)
-            fp_shard = dequantize_tensor_blockwise(
-                q_shard,
+            fp_shard = unpack_dequantize_tensor_blockwise(
+                gathered_packed[rank_idx],
                 gathered_scales[rank_idx],
+                self.bitwidth,
+                shard_len,
                 block_size=self.block_size,
                 dtype=torch.float32,
                 device=flat.device,
@@ -287,6 +286,7 @@ class LowBitGroup:
         local_size = dist.get_world_size(local_group)
         global_size = dist.get_world_size(self.pg)
         is_local_leader = global_rank % local_size == 0
+        local_leader_global = global_rank - local_rank
 
         rank_tensor = torch.tensor(
             [global_rank],
@@ -315,8 +315,7 @@ class LowBitGroup:
                 # only the inter-node stage is compressed.
                 # Local communication is high-bandwidth: keep it full precision.
                 # print(f"[Global Rank {global_rank}] Starting local all-reduce for chunk {idx} with numel {chunk.numel()}")
-                dist.reduce(chunk, dst=dist.get_rank() - dist.get_rank() % local_size, group=local_group, op=dist.ReduceOp.SUM)
-                # dist.reduce(chunk, dst=0, group=local_group, op=dist.ReduceOp.SUM)
+                dist.reduce(chunk, dst=local_leader_global, group=local_group, op=dist.ReduceOp.SUM)
                 
                 # dist.all_reduce(chunk, group=local_group, op=dist.ReduceOp.SUM)
                 # print(f"[Global Rank {global_rank}] Finished local all-reduce for chunk {idx}")
@@ -324,13 +323,12 @@ class LowBitGroup:
 
             # Compatibility mode: quantize the local stage as well, which
             # preserves the original all-lowbit pipeline behavior.
-            q_local, local_scales = quantize_tensor_blockwise(
+            packed_local, local_scales, numel = quantize_pack_tensor_blockwise(
                 chunk,
                 self.bitwidth,
                 block_size=self.block_size,
                 stochastic_rounding=self.stochastic_rounding,
             )
-            packed_local, numel = pack_lowbit(q_local, self.bitwidth)
             numels[idx] = numel
             packed_templates[idx] = packed_local
             scale_templates[idx] = local_scales
@@ -344,10 +342,11 @@ class LowBitGroup:
             if is_local_leader:
                 local_sum = torch.zeros(numel, dtype=torch.float32, device=chunk.device)
                 for gather_idx in range(local_size):
-                    q_part = unpack_lowbit(gathered_packed[gather_idx], self.bitwidth, numel)
-                    fp_part = dequantize_tensor_blockwise(
-                        q_part,
+                    fp_part = unpack_dequantize_tensor_blockwise(
+                        gathered_packed[gather_idx],
                         gathered_scales[gather_idx],
+                        self.bitwidth,
+                        numel,
                         block_size=self.block_size,
                         dtype=torch.float32,
                         device=chunk.device,
@@ -377,34 +376,31 @@ class LowBitGroup:
                     bcast_buffers[idx] = torch.empty_like(chunk)
 
                 # print(f"[Global Rank {global_rank}] Broadcasting inter-node result for chunk {idx} with numel {chunk.numel()}")
-                dist.broadcast(bcast_buffers[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
-                # dist.broadcast(bcast_buffers[idx], src=0, group=local_group)
+                dist.broadcast(bcast_buffers[idx], src=local_leader_global, group=local_group)
                 chunk.copy_(bcast_buffers[idx])
                 return
 
             if is_local_leader:
-                q_bcast, bcast_scales = quantize_tensor_blockwise(
+                packed_bcast, bcast_scales, _ = quantize_pack_tensor_blockwise(
                     inter_results[idx],
                     self.bitwidth,
                     block_size=self.block_size,
                     stochastic_rounding=self.stochastic_rounding,
                 )
-                packed_bcast, _ = pack_lowbit(q_bcast, self.bitwidth)
                 packed_bcasts[idx] = packed_bcast
                 bcast_scale_tensors[idx] = bcast_scales
             else:
                 packed_bcasts[idx] = torch.empty_like(packed_templates[idx])
                 bcast_scale_tensors[idx] = torch.empty_like(scale_templates[idx])
 
-            # dist.broadcast(packed_bcasts[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
-            # dist.broadcast(bcast_scale_tensors[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
-            dist.broadcast(packed_bcasts[idx], src=0, group=local_group)
-            dist.broadcast(bcast_scale_tensors[idx], src=0, group=local_group)
+            dist.broadcast(packed_bcasts[idx], src=local_leader_global, group=local_group)
+            dist.broadcast(bcast_scale_tensors[idx], src=local_leader_global, group=local_group)
 
-            q_recv = unpack_lowbit(packed_bcasts[idx], self.bitwidth, numels[idx])
-            fp_recv = dequantize_tensor_blockwise(
-                q_recv,
+            fp_recv = unpack_dequantize_tensor_blockwise(
+                packed_bcasts[idx],
                 bcast_scale_tensors[idx],
+                self.bitwidth,
+                numels[idx],
                 block_size=self.block_size,
                 dtype=torch.float32,
                 device=chunk.device,
