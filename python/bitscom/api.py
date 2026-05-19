@@ -377,8 +377,8 @@ class LowBitGroup:
                     bcast_buffers[idx] = torch.empty_like(chunk)
 
                 # print(f"[Global Rank {global_rank}] Broadcasting inter-node result for chunk {idx} with numel {chunk.numel()}")
-                # dist.broadcast(bcast_buffers[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
-                dist.broadcast(bcast_buffers[idx], src=0, group=local_group)
+                dist.broadcast(bcast_buffers[idx], src=dist.get_rank() - dist.get_rank() % local_size, group=local_group)
+                # dist.broadcast(bcast_buffers[idx], src=0, group=local_group)
                 chunk.copy_(bcast_buffers[idx])
                 return
 
