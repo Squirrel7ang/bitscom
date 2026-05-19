@@ -10,6 +10,8 @@
 import torch
 import torch.distributed as dist
 
+from .quantization import DEFAULT_BLOCK_SIZE
+
 # 导入 C++ extension
 try:
     from bitscom._lowbit_c import create_backend, ProcessGroupLowBit, LowBitOptions
@@ -28,6 +30,8 @@ _REGISTERED = False
 _BACKEND_BITWIDTH = 4
 _BACKEND_ERROR_FEEDBACK = False
 _BACKEND_ERROR_FEEDBACK_MODE = "none"
+_BACKEND_BLOCK_SIZE = DEFAULT_BLOCK_SIZE
+_BACKEND_STAGE2_ERROR_FEEDBACK = False
 
 _VALID_EF_MODES = {
     "auto",
@@ -58,6 +62,8 @@ def _create_lowbit_pg(store, rank, size, timeout):
         bitwidth=_BACKEND_BITWIDTH,
         error_feedback=_BACKEND_ERROR_FEEDBACK,
         error_feedback_mode=_BACKEND_ERROR_FEEDBACK_MODE,
+        block_size=_BACKEND_BLOCK_SIZE,
+        stage2_error_feedback=_BACKEND_STAGE2_ERROR_FEEDBACK,
     )
 
 
@@ -81,6 +87,8 @@ def register_lowbit_backend(
     bitwidth: int = 4,
     error_feedback: bool = False,
     error_feedback_mode: str | None = None,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    stage2_error_feedback: bool | None = None,
 ):
     """
     将 'lowbit' 注册为 torch.distributed 的可用 backend。
@@ -88,16 +96,22 @@ def register_lowbit_backend(
         dist.init_process_group(backend="lowbit", ...)
 
     error_feedback_mode: none / legacy / ef21 / ef21_plus
+    block_size: block quantization size
+    stage2_error_feedback: enable error feedback on the second quantization stage
     """
     global _REGISTERED
     global _BACKEND_BITWIDTH
     global _BACKEND_ERROR_FEEDBACK
     global _BACKEND_ERROR_FEEDBACK_MODE
+    global _BACKEND_BLOCK_SIZE
+    global _BACKEND_STAGE2_ERROR_FEEDBACK
 
     if bitwidth not in (1, 2, 4, 8, 12, 16):
         raise ValueError(
             f"bitwidth must be one of (1, 2, 4, 8, 12, 16), got {bitwidth}"
         )
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}")
 
     if error_feedback_mode is None:
         resolved_mode = "legacy" if error_feedback else "none"
@@ -107,23 +121,34 @@ def register_lowbit_backend(
             resolved_mode = "legacy" if error_feedback else "none"
         error_feedback = resolved_mode != "none"
 
+    if stage2_error_feedback is None:
+        resolved_stage2 = resolved_mode == "ef21_plus"
+    else:
+        resolved_stage2 = bool(stage2_error_feedback)
+
     if _REGISTERED:
         if (
             bitwidth != _BACKEND_BITWIDTH
             or error_feedback != _BACKEND_ERROR_FEEDBACK
             or resolved_mode != _BACKEND_ERROR_FEEDBACK_MODE
+            or block_size != _BACKEND_BLOCK_SIZE
+            or resolved_stage2 != _BACKEND_STAGE2_ERROR_FEEDBACK
         ):
             raise RuntimeError(
                 "lowbit backend is already registered with different options: "
                 f"bitwidth={_BACKEND_BITWIDTH}, "
                 f"error_feedback={_BACKEND_ERROR_FEEDBACK}, "
-                f"error_feedback_mode={_BACKEND_ERROR_FEEDBACK_MODE}"
+                f"error_feedback_mode={_BACKEND_ERROR_FEEDBACK_MODE}, "
+                f"block_size={_BACKEND_BLOCK_SIZE}, "
+                f"stage2_error_feedback={_BACKEND_STAGE2_ERROR_FEEDBACK}"
             )
         return
 
     _BACKEND_BITWIDTH = bitwidth
     _BACKEND_ERROR_FEEDBACK = bool(error_feedback)
     _BACKEND_ERROR_FEEDBACK_MODE = resolved_mode
+    _BACKEND_BLOCK_SIZE = int(block_size)
+    _BACKEND_STAGE2_ERROR_FEEDBACK = resolved_stage2
 
     if not _HAS_EXTENSION:
         raise RuntimeError(

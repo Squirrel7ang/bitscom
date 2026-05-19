@@ -9,7 +9,13 @@ import torch.multiprocessing as mp
 
 import bitscom
 from bitscom.api import LowBitGroup
-from bitscom.quantization import dequantize_tensor, pack_lowbit, quantize_tensor, unpack_lowbit
+from bitscom.quantization import (
+    DEFAULT_BLOCK_SIZE,
+    dequantize_tensor_blockwise,
+    pack_lowbit,
+    quantize_tensor_blockwise,
+    unpack_lowbit,
+)
 
 
 pytestmark = pytest.mark.integration
@@ -72,7 +78,11 @@ STOCHASTIC_CASES = [
 ]
 
 
-def _simulate_lowbit_allreduce_cpu(inputs: list[torch.Tensor], bitwidth: int) -> list[torch.Tensor]:
+def _simulate_lowbit_allreduce_cpu(
+    inputs: list[torch.Tensor],
+    bitwidth: int,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+) -> list[torch.Tensor]:
     world_size = len(inputs)
     if world_size == 0:
         return []
@@ -90,17 +100,26 @@ def _simulate_lowbit_allreduce_cpu(inputs: list[torch.Tensor], bitwidth: int) ->
 
     shard_len = flats[0].numel() // world_size
     packed_by_src: list[list[torch.Tensor]] = []
-    scale_by_src: list[list[float]] = []
+    scale_by_src: list[list[torch.Tensor]] = []
 
     for flat in flats:
-        q, scale = quantize_tensor(flat, bitwidth, stochastic_rounding=False)
-        q_shards = list(q.split(shard_len))
-        packed_shards = [pack_lowbit(shard, bitwidth)[0] for shard in q_shards]
+        shards = list(flat.split(shard_len))
+        packed_shards: list[torch.Tensor] = []
+        scale_shards: list[torch.Tensor] = []
+        for shard in shards:
+            q_shard, scales = quantize_tensor_blockwise(
+                shard,
+                bitwidth,
+                block_size=block_size,
+                stochastic_rounding=False,
+            )
+            packed_shards.append(pack_lowbit(q_shard, bitwidth)[0])
+            scale_shards.append(scales)
         packed_by_src.append(packed_shards)
-        scale_by_src.append([float(scale) for _ in range(world_size)])
+        scale_by_src.append(scale_shards)
 
     reduced_packed: list[torch.Tensor] = []
-    reduced_scales: list[float] = []
+    reduced_scales: list[torch.Tensor] = []
 
     for dst_rank in range(world_size):
         local_sum = torch.zeros(shard_len, dtype=torch.float32)
@@ -110,29 +129,32 @@ def _simulate_lowbit_allreduce_cpu(inputs: list[torch.Tensor], bitwidth: int) ->
                 bitwidth,
                 shard_len,
             )
-            fp_part = dequantize_tensor(
+            fp_part = dequantize_tensor_blockwise(
                 q_part,
                 scale_by_src[src_rank][dst_rank],
+                block_size=block_size,
                 dtype=torch.float32,
                 device=torch.device("cpu"),
             )
             local_sum.add_(fp_part)
 
-        q_reduced, reduced_scale = quantize_tensor(
+        q_reduced, reduced_scale_blocks = quantize_tensor_blockwise(
             local_sum,
             bitwidth,
+            block_size=block_size,
             stochastic_rounding=False,
         )
         packed_reduced, _ = pack_lowbit(q_reduced, bitwidth)
         reduced_packed.append(packed_reduced)
-        reduced_scales.append(float(reduced_scale))
+        reduced_scales.append(reduced_scale_blocks)
 
     out_shards = []
     for shard_rank in range(world_size):
         q_shard = unpack_lowbit(reduced_packed[shard_rank], bitwidth, shard_len)
-        fp_shard = dequantize_tensor(
+        fp_shard = dequantize_tensor_blockwise(
             q_shard,
             reduced_scales[shard_rank],
+            block_size=block_size,
             dtype=torch.float32,
             device=torch.device("cpu"),
         )

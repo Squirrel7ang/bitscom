@@ -20,13 +20,14 @@
 
 - 支持 bitwidth：`1, 2, 4, 8, 12, 16`
 - `quantize_tensor` / `dequantize_tensor`
+- `quantize_tensor_blockwise` / `dequantize_tensor_blockwise`
 - `pack_lowbit` / `unpack_lowbit`
 - `compress_tensor` / `decompress_tensor`
 - `roundtrip_tensor`
 
 设计说明：
 
-- 使用 per-tensor 对称量化（按张量最大绝对值计算 scale）。
+- 使用 per-tensor 与 blockwise 对称量化（按最大绝对值计算 scale）。
 - 先量化为 int16，再做 bit-pack，便于统一支持多 bitwidth。
 - 对 1-bit 使用两级表示，避免数值边界导致的除零问题。
 - 所有路径尽量使用张量向量化操作，减少 Python 循环。

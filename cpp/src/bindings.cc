@@ -23,9 +23,19 @@ c10::intrusive_ptr<c10d::Backend> createBackend(
     const std::chrono::milliseconds& timeout,
     int bitwidth,
     bool error_feedback,
-    const std::string& error_feedback_mode) {
+    const std::string& error_feedback_mode,
+    int block_size,
+    bool stage2_error_feedback) {
     return bitscom::createProcessGroupLowBit(
-        store, rank, size, timeout, bitwidth, error_feedback, error_feedback_mode);
+        store,
+        rank,
+        size,
+        timeout,
+        bitwidth,
+        error_feedback,
+        error_feedback_mode,
+        block_size,
+        stage2_error_feedback);
 }
 
 PYBIND11_MODULE(_lowbit_c, m) {
@@ -36,7 +46,9 @@ PYBIND11_MODULE(_lowbit_c, m) {
         .def(py::init<>())
         .def_readwrite("bitwidth", &bitscom::LowBitOptions::bitwidth)
         .def_readwrite("error_feedback", &bitscom::LowBitOptions::error_feedback)
-        .def_readwrite("error_feedback_mode", &bitscom::LowBitOptions::error_feedback_mode);
+        .def_readwrite("error_feedback_mode", &bitscom::LowBitOptions::error_feedback_mode)
+        .def_readwrite("block_size", &bitscom::LowBitOptions::block_size)
+        .def_readwrite("stage2_error_feedback", &bitscom::LowBitOptions::stage2_error_feedback);
 
     // 暴露 ProcessGroupLowBit（作为 Backend 的子类）
     py::class_<
@@ -64,5 +76,7 @@ PYBIND11_MODULE(_lowbit_c, m) {
             py::arg("timeout") = std::chrono::milliseconds(600000),
             py::arg("bitwidth") = 4,
                         py::arg("error_feedback") = false,
-                        py::arg("error_feedback_mode") = "auto");
+                        py::arg("error_feedback_mode") = "auto",
+                        py::arg("block_size") = 256,
+                        py::arg("stage2_error_feedback") = true);
 }

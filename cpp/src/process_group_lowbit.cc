@@ -120,6 +120,7 @@ ProcessGroupLowBit::ProcessGroupLowBit(
         store, rank, size, std::move(nccl_options));
 
     error_feedback_mode_ = parseErrorFeedbackMode(options_);
+    TORCH_CHECK(options_.block_size > 0, "block_size must be > 0, got ", options_.block_size);
 
     std::cout << "[LowBit] ProcessGroupLowBit created: rank=" << rank
               << " size=" << size
@@ -145,18 +146,41 @@ std::tuple<at::Tensor, at::Tensor> ProcessGroupLowBit::pack(const at::Tensor& in
 
     const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
     const int qmax = (bitwidth == 1) ? 1 : ((1 << (bitwidth - 1)) - 1);
+    const int64_t numel = flat.numel();
+    if (numel == 0) {
+        auto scale = at::empty({0}, flat.options().dtype(at::kHalf));
+        auto packed = at::empty({0}, flat.options().dtype(at::kByte));
+        return std::make_tuple(packed, scale);
+    }
 
-    auto max_abs_t = at::abs(flat).max();
-    float max_abs = max_abs_t.item<float>();
-    float scale_v = (max_abs == 0.0f) ? 1.0f : (max_abs / static_cast<float>(qmax));
-    auto scale = at::full({1}, scale_v, flat.options());
+    const int64_t block_size = options_.block_size;
+    const int64_t num_blocks = (numel + block_size - 1) / block_size;
+    const int64_t padded = num_blocks * block_size;
+    if (padded != numel) {
+        auto zeros = at::zeros({padded - numel}, flat.options());
+        flat = at::cat({flat, zeros}, 0);
+    }
 
-    auto q = at::round(flat / scale_v).clamp(qmin, qmax).to(at::kInt);
-    auto values = (q - qmin).to(at::kInt).contiguous().view(-1);
+    auto blocks = flat.view({num_blocks, block_size});
+    auto abs_blocks = at::abs(blocks);
+    auto max_abs = std::get<0>(abs_blocks.max(1));
+    auto scale = max_abs / static_cast<float>(qmax);
+    scale = at::where(max_abs > 0, scale, at::ones_like(scale));
+    auto scale_half = scale.to(at::kHalf);
+
+    auto scale_f = scale_half.to(at::kFloat);
+    auto normalized = abs_blocks / scale_f.unsqueeze(1);
+    auto mag = at::round(normalized);
+    auto signed_vals = (bitwidth == 1) ? mag : mag * at::sign(blocks);
+    auto q = signed_vals.clamp(qmin, qmax).to(at::kInt);
+    auto values = (q.view({-1}).slice(0, 0, numel) - qmin)
+                      .to(at::kInt)
+                      .contiguous()
+                      .view(-1);
 
     const int per_byte = 8 / bitwidth;
-    const int64_t numel = values.numel();
-    const int64_t pad = (per_byte - (numel % per_byte)) % per_byte;
+    const int64_t packed_numel = values.numel();
+    const int64_t pad = (per_byte - (packed_numel % per_byte)) % per_byte;
     if (pad > 0) {
         auto zeros = at::zeros({pad}, values.options());
         values = at::cat({values, zeros}, 0);
@@ -165,7 +189,7 @@ std::tuple<at::Tensor, at::Tensor> ProcessGroupLowBit::pack(const at::Tensor& in
     values = values.view({-1, per_byte});
     auto shifts = at::arange(0, per_byte, values.options()) * bitwidth;
     auto packed = at::sum(at::bitwise_left_shift(values, shifts), 1).to(at::kByte);
-    return std::make_tuple(packed.contiguous(), scale);
+    return std::make_tuple(packed.contiguous(), scale_half);
 }
 
 at::Tensor ProcessGroupLowBit::unpack(
@@ -192,8 +216,26 @@ at::Tensor ProcessGroupLowBit::unpack(
         mask).reshape(-1);
     auto q = expanded.slice(0, 0, numel).to(at::kFloat) + static_cast<float>(qmin);
 
-    float scale_v = scale.item<float>();
-    auto out = (q * scale_v).to(device, out_dtype);
+    if (numel == 0) {
+        return q.to(device, out_dtype);
+    }
+
+    const int64_t block_size = options_.block_size;
+    const int64_t num_blocks = scale.numel();
+    const int64_t expected_blocks = (numel + block_size - 1) / block_size;
+    TORCH_CHECK(
+        num_blocks == expected_blocks,
+        "scale blocks mismatch: got ", num_blocks, " expected ", expected_blocks);
+
+    const int64_t padded = num_blocks * block_size;
+    if (padded != numel) {
+        auto zeros = at::zeros({padded - numel}, q.options());
+        q = at::cat({q, zeros}, 0);
+    }
+
+    auto q_blocks = q.view({num_blocks, block_size});
+    auto scale_f = scale.to(at::kFloat).view({num_blocks, 1});
+    auto out = (q_blocks * scale_f).view({-1}).slice(0, 0, numel).to(device, out_dtype);
     return out;
 }
 
@@ -209,7 +251,8 @@ bool ProcessGroupLowBit::useStage1ErrorFeedback() const {
 }
 
 bool ProcessGroupLowBit::useStage2ErrorFeedback() const {
-    return error_feedback_mode_ == ErrorFeedbackMode::kEF21Plus;
+    return options_.stage2_error_feedback &&
+        error_feedback_mode_ == ErrorFeedbackMode::kEF21Plus;
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
@@ -603,13 +646,17 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     const std::chrono::milliseconds& timeout,
     int bitwidth,
     bool error_feedback,
-    const std::string& error_feedback_mode) {
+    const std::string& error_feedback_mode,
+    int block_size,
+    bool stage2_error_feedback) {
 
     LowBitOptions opts;
     opts.timeout = timeout;
     opts.bitwidth = bitwidth;
     opts.error_feedback = error_feedback;
     opts.error_feedback_mode = error_feedback_mode;
+    opts.block_size = block_size;
+    opts.stage2_error_feedback = stage2_error_feedback;
     return c10::make_intrusive<ProcessGroupLowBit>(
         store, rank, size, std::move(opts));
 }

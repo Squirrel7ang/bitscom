@@ -28,12 +28,13 @@ bitscom 是一个面向 PyTorch 的低比特分布式通信库。
 - 量化随机舍入（stochastic rounding，CPU + CUDA）
 - `LowBitGroup.compress()` 与 `LowBitGroup.decompress()` 辅助接口
 - 可选模拟模式（`simulate_quantization=True`），用于在通信前验证量化影响
+- 低比特 all-reduce 的分块量化与 FP16 放缩因子
 - `<8bit` 的 Python 低比特 all-reduce 管线（`all-to-all -> local reduce -> all-gather`）
 - 分层方案 A 低比特 all-reduce（`local reduce -> inter lowbit all-reduce -> local broadcast`）
 - 多机 CUDA 双流流水调度（`warmup -> steady -> cooldown`）
 - 单机仅 `local_group` 快速路径：一次全精度 all-reduce，不走分块流水
 - C++ 后端低比特 allreduce 路径第一段量化的 error-feedback
-- 显式后端注册参数：`bitwidth` 与 `error_feedback`
+- 显式后端注册参数：`bitwidth` / `error_feedback` / `block_size` / `stage2_error_feedback`
 - C++ 扩展缺失时的稳健注册报错
 - 构建时自动生成 `compile_commands.json`（用于 clangd）
 
