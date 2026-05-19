@@ -315,8 +315,8 @@ class LowBitGroup:
                 # only the inter-node stage is compressed.
                 # Local communication is high-bandwidth: keep it full precision.
                 # print(f"[Global Rank {global_rank}] Starting local all-reduce for chunk {idx} with numel {chunk.numel()}")
-                # dist.reduce(chunk, dst=dist.get_rank() - dist.get_rank() % local_size, group=local_group, op=dist.ReduceOp.SUM)
-                dist.reduce(chunk, dst=0, group=local_group, op=dist.ReduceOp.SUM)
+                dist.reduce(chunk, dst=dist.get_rank() - dist.get_rank() % local_size, group=local_group, op=dist.ReduceOp.SUM)
+                # dist.reduce(chunk, dst=0, group=local_group, op=dist.ReduceOp.SUM)
                 
                 # dist.all_reduce(chunk, group=local_group, op=dist.ReduceOp.SUM)
                 # print(f"[Global Rank {global_rank}] Finished local all-reduce for chunk {idx}")
@@ -365,7 +365,8 @@ class LowBitGroup:
                 inter_results[idx] = self._lowbit_allreduce_via_alltoall_group(inter_in, inter_group)
             else:
                 inter_results[idx] = None
-            dist.barrier(group=local_group)
+            barrier_device_ids = [torch.cuda.current_device()] if chunk.is_cuda else None
+            dist.barrier(group=local_group, device_ids=barrier_device_ids)
 
         def _finalize_phase(idx: int) -> None:
             chunk = chunks[idx]
