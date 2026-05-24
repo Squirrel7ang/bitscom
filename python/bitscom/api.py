@@ -2,13 +2,17 @@
 High-level API for low-bit distributed communication.
 """
 
+import os
+import time
+from typing import Optional, List
+
 import torch
 import torch.distributed as dist
-from typing import Optional, List
 
 from .quantization import (
     DEFAULT_BLOCK_SIZE,
     SUPPORTED_BITWIDTHS,
+    _HAS_CUDA_KERNELS,
     CompressedTensor,
     compress_tensor,
     decompress_tensor,
@@ -72,6 +76,26 @@ class LowBitGroup:
         self.stochastic_rounding = stochastic_rounding
         self.block_size = int(block_size)
 
+    def _comm_debug_enabled(self) -> bool:
+        return os.environ.get("BITSCOM_COMM_DEBUG", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _comm_debug(self, message: str) -> None:
+        if not self._comm_debug_enabled():
+            return
+        try:
+            rank = dist.get_rank(self.pg)
+        except Exception:
+            rank = -1
+        print(
+            f"[bitscom-debug rank={rank} bitwidth={self.bitwidth}] {message}",
+            flush=True,
+        )
+
     @property
     def rank(self) -> int:
         return dist.get_rank(self.pg)
@@ -96,6 +120,16 @@ class LowBitGroup:
         当使用 lowbit backend 时，底层 C++ 会自动进行
         pack -> NCCL allreduce -> unpack 的流程。
         """
+        if self._comm_debug_enabled():
+            self._comm_debug(
+                "all_reduce entry "
+                f"numel={int(tensor.numel())} dtype={tensor.dtype} "
+                f"device={tensor.device} op={op} async_op={async_op} "
+                f"local_group={local_group is not None} "
+                f"inter_group={inter_group is not None} "
+                f"local_quantize={local_quantize} "
+                f"chunk_size={chunk_size}"
+            )
         if (
             local_group is not None
             and inter_group is None
@@ -105,18 +139,20 @@ class LowBitGroup:
             # Single-node topology: keep local communication dense and avoid
             # introducing packing/unpacking overhead where bandwidth is not the bottleneck.
             if local_quantize:
+                self._comm_debug("path=local_group_lowbit")
                 flat = tensor.contiguous().view(-1)
                 reduced = self._lowbit_allreduce_via_alltoall_group(flat, local_group).view_as(tensor)
                 tensor.copy_(reduced.to(dtype=tensor.dtype))
             else:
                 # Single-node topology: local collective does not need compression.
+                self._comm_debug("path=local_group_dense")
                 dist.all_reduce(tensor, op=op, group=local_group)
             if async_op:
                 return _ImmediateWork()
             return None
 
         if self._should_use_pipeline_a(op, local_group, inter_group):
-
+            self._comm_debug("path=hierarchical_lowbit_pipeline_a")
             self._hierarchical_lowbit_allreduce_pipeline_a(
                 tensor,
                 local_group=local_group,
@@ -129,13 +165,17 @@ class LowBitGroup:
             return None
 
         if self._should_use_lowbit_path(op):
+            self._comm_debug("path=flat_lowbit_alltoall")
             self._lowbit_allreduce_via_alltoall(tensor)
             if async_op:
                 return _ImmediateWork()
             return None
 
         if self.simulate_quantization:
+            self._comm_debug("path=dense_with_quantization_simulation")
             tensor.copy_(roundtrip_tensor(tensor, self.bitwidth))
+        else:
+            self._comm_debug("path=dense_all_reduce")
         work = dist.all_reduce(tensor, op=op, group=self.pg, async_op=True)
         if not async_op:
             work.wait()
@@ -185,6 +225,8 @@ class LowBitGroup:
         flat: torch.Tensor,
         group: dist.ProcessGroup,
     ) -> torch.Tensor:
+        debug = self._comm_debug_enabled()
+        t0 = time.perf_counter()
         world_size = dist.get_world_size(group)
         original_numel = int(flat.numel())
         if original_numel == 0:
@@ -202,9 +244,21 @@ class LowBitGroup:
 
         shard_len = flat.numel() // world_size
         shards = list(flat.split(shard_len))
+        if debug:
+            self._comm_debug(
+                "lowbit allreduce start "
+                f"numel={original_numel} padded_numel={flat.numel()} "
+                f"world_size={world_size} shard_len={shard_len} "
+                f"dtype={flat.dtype} device={flat.device} "
+                f"block_size={self.block_size} "
+                f"cuda_kernels={_HAS_CUDA_KERNELS}"
+            )
+
         send_packed = []
         send_scales = []
-        for shard in shards:
+        for shard_idx, shard in enumerate(shards):
+            if debug:
+                self._comm_debug(f"quantize shard {shard_idx} start")
             packed, scales, _ = quantize_pack_tensor_blockwise(
                 shard,
                 self.bitwidth,
@@ -213,15 +267,30 @@ class LowBitGroup:
             )
             send_packed.append(packed)
             send_scales.append(scales)
+            if debug:
+                self._comm_debug(
+                    f"quantize shard {shard_idx} done "
+                    f"packed_numel={packed.numel()} scales_numel={scales.numel()}"
+                )
 
         recv_packed = [torch.empty_like(send_packed[0]) for _ in range(world_size)]
+        if debug:
+            self._comm_debug("all_to_all packed start")
         dist.all_to_all(recv_packed, send_packed, group=group)
+        if debug:
+            self._comm_debug("all_to_all packed done")
 
         recv_scales = [torch.empty_like(send_scales[0]) for _ in range(world_size)]
+        if debug:
+            self._comm_debug("all_to_all scales start")
         dist.all_to_all(recv_scales, send_scales, group=group)
+        if debug:
+            self._comm_debug("all_to_all scales done")
 
         local_sum = torch.zeros(shard_len, dtype=torch.float32, device=flat.device)
         for src_rank in range(world_size):
+            if debug:
+                self._comm_debug(f"unpack received shard from src={src_rank} start")
             fp_part = unpack_dequantize_tensor_blockwise(
                 recv_packed[src_rank],
                 recv_scales[src_rank],
@@ -232,24 +301,44 @@ class LowBitGroup:
                 device=flat.device,
             )
             local_sum.add_(fp_part)
+            if debug:
+                self._comm_debug(f"unpack received shard from src={src_rank} done")
 
+        if debug:
+            self._comm_debug("quantize reduced shard start")
         packed_reduced, reduced_scales, _ = quantize_pack_tensor_blockwise(
             local_sum,
             self.bitwidth,
             block_size=self.block_size,
             stochastic_rounding=self.stochastic_rounding,
         )
+        if debug:
+            self._comm_debug(
+                "quantize reduced shard done "
+                f"packed_numel={packed_reduced.numel()} "
+                f"scales_numel={reduced_scales.numel()}"
+            )
 
         gathered_packed = [torch.empty_like(packed_reduced) for _ in range(world_size)]
+        if debug:
+            self._comm_debug("all_gather packed start")
         dist.all_gather(gathered_packed, packed_reduced, group=group)
+        if debug:
+            self._comm_debug("all_gather packed done")
 
         gathered_scales = [
             torch.empty_like(reduced_scales) for _ in range(world_size)
         ]
+        if debug:
+            self._comm_debug("all_gather scales start")
         dist.all_gather(gathered_scales, reduced_scales, group=group)
+        if debug:
+            self._comm_debug("all_gather scales done")
 
         out_shards = []
         for rank_idx in range(world_size):
+            if debug:
+                self._comm_debug(f"unpack gathered shard {rank_idx} start")
             fp_shard = unpack_dequantize_tensor_blockwise(
                 gathered_packed[rank_idx],
                 gathered_scales[rank_idx],
@@ -260,8 +349,14 @@ class LowBitGroup:
                 device=flat.device,
             )
             out_shards.append(fp_shard)
+            if debug:
+                self._comm_debug(f"unpack gathered shard {rank_idx} done")
 
         restored = torch.cat(out_shards, dim=0)
+        if debug:
+            self._comm_debug(
+                f"lowbit allreduce done elapsed_s={time.perf_counter() - t0:.3f}"
+            )
         return restored[:original_numel]
 
     def _hierarchical_lowbit_allreduce_pipeline_a(
@@ -287,6 +382,16 @@ class LowBitGroup:
         global_size = dist.get_world_size(self.pg)
         is_local_leader = global_rank % local_size == 0
         local_leader_global = global_rank - local_rank
+        debug = self._comm_debug_enabled()
+        if debug:
+            self._comm_debug(
+                "pipeline_a start "
+                f"numel={int(flat.numel())} chunks={num_chunks} "
+                f"chunk_elems={chunk_elems} local_rank={local_rank} "
+                f"local_size={local_size} global_rank={global_rank} "
+                f"global_size={global_size} is_local_leader={is_local_leader} "
+                f"local_leader_global={local_leader_global}"
+            )
 
         rank_tensor = torch.tensor(
             [global_rank],
@@ -309,6 +414,11 @@ class LowBitGroup:
 
         def _local_phase(idx: int) -> None:
             chunk = chunks[idx]
+            if debug:
+                self._comm_debug(
+                    f"pipeline_a local_phase chunk={idx} start "
+                    f"numel={int(chunk.numel())} local_quantize={local_quantize}"
+                )
             # print(f"[Global Rank {global_rank}] Starting local phase for chunk {idx} with numel {chunk.numel()}")
             if not local_quantize:
                 # In the default mode, local collectives stay full precision and
@@ -319,6 +429,8 @@ class LowBitGroup:
                 
                 # dist.all_reduce(chunk, group=local_group, op=dist.ReduceOp.SUM)
                 # print(f"[Global Rank {global_rank}] Finished local all-reduce for chunk {idx}")
+                if debug:
+                    self._comm_debug(f"pipeline_a local_phase chunk={idx} dense_reduce done")
                 return
 
             # Compatibility mode: quantize the local stage as well, which
@@ -353,9 +465,16 @@ class LowBitGroup:
                     )
                     local_sum.add_(fp_part)
                 inter_results[idx] = local_sum
+            if debug:
+                self._comm_debug(f"pipeline_a local_phase chunk={idx} lowbit done")
 
         def _inter_phase(idx: int) -> None:
             chunk = chunks[idx]
+            if debug:
+                self._comm_debug(
+                    f"pipeline_a inter_phase chunk={idx} start "
+                    f"is_local_leader={is_local_leader}"
+                )
             if is_local_leader:
                 # The inter stage always uses the low-bit all-reduce path because
                 # this is where bandwidth pressure is highest in multi-node runs.
@@ -366,9 +485,16 @@ class LowBitGroup:
                 inter_results[idx] = None
             barrier_device_ids = [torch.cuda.current_device()] if chunk.is_cuda else None
             dist.barrier(group=local_group, device_ids=barrier_device_ids)
+            if debug:
+                self._comm_debug(f"pipeline_a inter_phase chunk={idx} done")
 
         def _finalize_phase(idx: int) -> None:
             chunk = chunks[idx]
+            if debug:
+                self._comm_debug(
+                    f"pipeline_a finalize_phase chunk={idx} start "
+                    f"is_local_leader={is_local_leader}"
+                )
             if not local_quantize:
                 if is_local_leader:
                     bcast_buffers[idx] = inter_results[idx].to(dtype=chunk.dtype)
@@ -378,6 +504,8 @@ class LowBitGroup:
                 # print(f"[Global Rank {global_rank}] Broadcasting inter-node result for chunk {idx} with numel {chunk.numel()}")
                 dist.broadcast(bcast_buffers[idx], src=local_leader_global, group=local_group)
                 chunk.copy_(bcast_buffers[idx])
+                if debug:
+                    self._comm_debug(f"pipeline_a finalize_phase chunk={idx} dense_broadcast done")
                 return
 
             if is_local_leader:
@@ -406,6 +534,8 @@ class LowBitGroup:
                 device=chunk.device,
             )
             chunk.copy_(fp_recv.to(dtype=chunk.dtype))
+            if debug:
+                self._comm_debug(f"pipeline_a finalize_phase chunk={idx} lowbit_broadcast done")
 
         if not self._should_use_dual_stream_pipeline(
             is_cuda=flat.is_cuda,
@@ -416,6 +546,8 @@ class LowBitGroup:
                 _local_phase(idx)
                 _inter_phase(idx)
                 _finalize_phase(idx)
+            if debug:
+                self._comm_debug("pipeline_a done")
             return
 
         intra_stream = torch.cuda.Stream(device=flat.device)
@@ -478,6 +610,8 @@ class LowBitGroup:
 
         intra_stream.synchronize()
         inter_stream.synchronize()
+        if debug:
+            self._comm_debug("pipeline_a done")
 
     def _lowbit_allreduce_via_alltoall(self, tensor: torch.Tensor) -> None:
         flat = tensor.contiguous().view(-1)
