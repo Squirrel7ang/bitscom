@@ -96,6 +96,27 @@ class LowBitGroup:
             flush=True,
         )
 
+    def _trace_explain_enabled(self) -> bool:
+        return os.environ.get("TRACE_EXPLAIN", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _comm_evidence(self, action: str, message: str) -> None:
+        if not self._trace_explain_enabled():
+            return
+        try:
+            rank = dist.get_rank(self.pg)
+        except Exception:
+            rank = -1
+        print(
+            f"[trace-evidence rank={rank}] component=bitscom "
+            f"action={action} bitwidth={self.bitwidth} {message}",
+            flush=True,
+        )
+
     @property
     def rank(self) -> int:
         return dist.get_rank(self.pg)
@@ -130,6 +151,15 @@ class LowBitGroup:
                 f"local_quantize={local_quantize} "
                 f"chunk_size={chunk_size}"
             )
+        self._comm_evidence(
+            "all_reduce_entry",
+            "meaning='bitscom LowBitGroup received a DP gradient buffer from "
+            "the training code and will choose the communication implementation' "
+            f"numel={int(tensor.numel())} dtype={tensor.dtype} "
+            f"device={tensor.device} async_op={async_op} "
+            f"local_group={local_group is not None} "
+            f"inter_group={inter_group is not None}",
+        )
         if (
             local_group is not None
             and inter_group is None
@@ -153,6 +183,13 @@ class LowBitGroup:
 
         if self._should_use_pipeline_a(op, local_group, inter_group):
             self._comm_debug("path=hierarchical_lowbit_pipeline_a")
+            self._comm_evidence(
+                "path_selected",
+                "meaning='bitscom selected hierarchical low-bit all-reduce: "
+                "dense local aggregation, low-bit inter-node communication, "
+                "then local broadcast back to all local ranks' "
+                f"local_quantize={local_quantize} chunk_size={chunk_size}",
+            )
             self._hierarchical_lowbit_allreduce_pipeline_a(
                 tensor,
                 local_group=local_group,
@@ -166,6 +203,11 @@ class LowBitGroup:
 
         if self._should_use_lowbit_path(op):
             self._comm_debug("path=flat_lowbit_alltoall")
+            self._comm_evidence(
+                "path_selected",
+                "meaning='bitscom selected flat low-bit all-reduce over the "
+                "whole process group' implementation=alltoall_quantized",
+            )
             self._lowbit_allreduce_via_alltoall(tensor)
             if async_op:
                 return _ImmediateWork()
@@ -253,12 +295,29 @@ class LowBitGroup:
                 f"block_size={self.block_size} "
                 f"cuda_kernels={_HAS_CUDA_KERNELS}"
             )
+        self._comm_evidence(
+            "lowbit_allreduce_plan",
+            "meaning='bitscom will split the flat gradient, quantize/pack each "
+            "shard, exchange packed payloads, unpack/dequantize, sum, then "
+            "gather the reduced low-bit shards back' "
+            f"original_numel={original_numel} padded_numel={int(flat.numel())} "
+            f"world_size={world_size} shard_len={shard_len} "
+            f"block_size={self.block_size} cuda_kernels={_HAS_CUDA_KERNELS}",
+        )
 
         send_packed = []
         send_scales = []
         for shard_idx, shard in enumerate(shards):
             if debug:
                 self._comm_debug(f"quantize shard {shard_idx} start")
+            if shard_idx == 0:
+                self._comm_evidence(
+                    "quantize_pack",
+                    "meaning='floating-point gradient shard is converted into "
+                    "low-bit packed values plus per-block scales before network "
+                    "communication' "
+                    f"shard_idx={shard_idx} shard_numel={int(shard.numel())}",
+                )
             packed, scales, _ = quantize_pack_tensor_blockwise(
                 shard,
                 self.bitwidth,
@@ -276,6 +335,12 @@ class LowBitGroup:
         recv_packed = [torch.empty_like(send_packed[0]) for _ in range(world_size)]
         if debug:
             self._comm_debug("all_to_all packed start")
+        self._comm_evidence(
+            "collective",
+            "meaning='packed low-bit payloads are exchanged across ranks; this "
+            "is the network communication over compressed data' collective=all_to_all "
+            f"world_size={world_size}",
+        )
         dist.all_to_all(recv_packed, send_packed, group=group)
         if debug:
             self._comm_debug("all_to_all packed done")
@@ -322,6 +387,12 @@ class LowBitGroup:
         gathered_packed = [torch.empty_like(packed_reduced) for _ in range(world_size)]
         if debug:
             self._comm_debug("all_gather packed start")
+        self._comm_evidence(
+            "collective",
+            "meaning='each rank gathers the reduced packed shards so every rank "
+            "can reconstruct the full reduced gradient buffer' collective=all_gather "
+            f"world_size={world_size}",
+        )
         dist.all_gather(gathered_packed, packed_reduced, group=group)
         if debug:
             self._comm_debug("all_gather packed done")
@@ -357,6 +428,12 @@ class LowBitGroup:
             self._comm_debug(
                 f"lowbit allreduce done elapsed_s={time.perf_counter() - t0:.3f}"
             )
+        self._comm_evidence(
+            "lowbit_allreduce_done",
+            "meaning='bitscom has reconstructed the reduced gradient buffer and "
+            "returns it to the POLAR hook' "
+            f"elapsed_s={time.perf_counter() - t0:.3f}",
+        )
         return restored[:original_numel]
 
     def _hierarchical_lowbit_allreduce_pipeline_a(
@@ -392,6 +469,15 @@ class LowBitGroup:
                 f"global_size={global_size} is_local_leader={is_local_leader} "
                 f"local_leader_global={local_leader_global}"
             )
+        self._comm_evidence(
+            "pipeline_a_plan",
+            "meaning='hierarchical bitscom path: local ranks first aggregate "
+            "inside a node, local leader performs low-bit inter-node all-reduce, "
+            "then the result is broadcast inside the node' "
+            f"chunks={num_chunks} chunk_elems={chunk_elems} "
+            f"local_rank={local_rank} local_size={local_size} "
+            f"is_local_leader={is_local_leader}",
+        )
 
         rank_tensor = torch.tensor(
             [global_rank],
@@ -418,6 +504,15 @@ class LowBitGroup:
                 self._comm_debug(
                     f"pipeline_a local_phase chunk={idx} start "
                     f"numel={int(chunk.numel())} local_quantize={local_quantize}"
+                )
+            if idx == 0:
+                self._comm_evidence(
+                    "pipeline_local_phase",
+                    "meaning='within-node aggregation starts; by default this "
+                    "phase is dense because intra-node bandwidth is not the "
+                    "bottleneck' "
+                    f"chunk={idx} numel={int(chunk.numel())} "
+                    f"local_quantize={local_quantize}",
                 )
             # print(f"[Global Rank {global_rank}] Starting local phase for chunk {idx} with numel {chunk.numel()}")
             if not local_quantize:
@@ -475,6 +570,14 @@ class LowBitGroup:
                     f"pipeline_a inter_phase chunk={idx} start "
                     f"is_local_leader={is_local_leader}"
                 )
+            if idx == 0:
+                self._comm_evidence(
+                    "pipeline_inter_node_phase",
+                    "meaning='the local leader now performs low-bit inter-node "
+                    "all-reduce; this is the bandwidth-sensitive part accelerated "
+                    "by bitscom quantization' "
+                    f"chunk={idx} is_local_leader={is_local_leader}",
+                )
             if is_local_leader:
                 # The inter stage always uses the low-bit all-reduce path because
                 # this is where bandwidth pressure is highest in multi-node runs.
@@ -494,6 +597,14 @@ class LowBitGroup:
                 self._comm_debug(
                     f"pipeline_a finalize_phase chunk={idx} start "
                     f"is_local_leader={is_local_leader}"
+                )
+            if idx == 0:
+                self._comm_evidence(
+                    "pipeline_finalize_phase",
+                    "meaning='the reduced inter-node result is distributed back "
+                    "to local ranks so every GPU receives the averaged DP "
+                    "gradient buffer' "
+                    f"chunk={idx} is_local_leader={is_local_leader}",
                 )
             if not local_quantize:
                 if is_local_leader:
