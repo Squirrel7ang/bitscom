@@ -29,6 +29,29 @@ class _ImmediateWork:
         return True
 
 
+class _CudaEventWork:
+    """Work-like handle backed by a CUDA event recorded on a comm stream."""
+
+    def __init__(
+        self,
+        event: torch.cuda.Event,
+        keepalive: Optional[List[torch.Tensor]] = None,
+    ):
+        self.event = event
+        self.keepalive = keepalive or []
+
+    def wait(self):
+        self.event.synchronize()
+        return True
+
+    def block_current_stream(self):
+        torch.cuda.current_stream().wait_event(self.event)
+        return True
+
+    def is_completed(self) -> bool:
+        return bool(self.event.query())
+
+
 class _NativeLowBitAllReduceWork:
     """Work-like low-bit all-reduce built from native async collectives."""
 
@@ -474,12 +497,84 @@ class LowBitGroup:
             return None
         return work
 
+    def all_reduce_stream(
+        self,
+        tensor: torch.Tensor,
+        *,
+        stream: torch.cuda.Stream,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+        group: Optional[dist.ProcessGroup] = None,
+        post_scale: float = 1.0,
+    ):
+        """Launch a low-bit all-reduce as a stream-ordered CUDA workload.
+
+        This path keeps the whole low-bit sequence on one caller-provided
+        stream: pack, all-to-all, unpack/reduce, repack, all-gather, final
+        unpack/copy. It returns an event-backed Work; callers can delay
+        waiting until the reduced tensor is actually needed.
+        """
+        process_group = group or self.pg
+        if op != dist.ReduceOp.SUM or not self._should_use_lowbit_path_for_group(
+            op,
+            process_group,
+        ):
+            if not tensor.is_cuda:
+                dist.all_reduce(tensor, op=op, group=process_group)
+                if post_scale != 1.0:
+                    tensor.mul_(post_scale)
+                return _ImmediateWork()
+            stream.wait_stream(torch.cuda.current_stream(tensor.device))
+            with torch.cuda.stream(stream):
+                work = dist.all_reduce(
+                    tensor,
+                    op=op,
+                    group=process_group,
+                    async_op=True,
+                )
+                self._block_work_on_current_stream(work)
+                if post_scale != 1.0:
+                    tensor.mul_(post_scale)
+                done = torch.cuda.Event()
+                done.record(stream)
+            return _CudaEventWork(done)
+
+        if not tensor.is_cuda:
+            self._lowbit_allreduce_via_alltoall_into_(tensor, process_group)
+            if post_scale != 1.0:
+                tensor.mul_(post_scale)
+            return _ImmediateWork()
+
+        return self._lowbit_allreduce_via_alltoall_stream_(
+            tensor,
+            process_group,
+            stream=stream,
+            post_scale=post_scale,
+        )
+
     def _should_use_lowbit_path(self, op: dist.ReduceOp) -> bool:
         return (
             self.bitwidth < 8
             and self.world_size > 1
             and op == dist.ReduceOp.SUM
         )
+
+    def _should_use_lowbit_path_for_group(
+        self,
+        op: dist.ReduceOp,
+        group: dist.ProcessGroup,
+    ) -> bool:
+        return (
+            self.bitwidth < 8
+            and dist.get_world_size(group) > 1
+            and op == dist.ReduceOp.SUM
+        )
+
+    @staticmethod
+    def _block_work_on_current_stream(work) -> None:
+        if hasattr(work, "block_current_stream"):
+            work.block_current_stream()
+        else:
+            work.wait()
 
     def _should_use_pipeline_a(
         self,
@@ -983,6 +1078,152 @@ class LowBitGroup:
         group: dist.ProcessGroup,
     ):
         return _NativeLowBitAllReduceWork(self, tensor, group)
+
+    def _lowbit_allreduce_via_alltoall_stream_(
+        self,
+        tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+        *,
+        stream: torch.cuda.Stream,
+        post_scale: float,
+    ):
+        debug = self._comm_debug_enabled()
+        world_size = dist.get_world_size(group)
+        original_numel = int(tensor.numel())
+        done = torch.cuda.Event()
+        if original_numel == 0:
+            stream.wait_stream(torch.cuda.current_stream(tensor.device))
+            with torch.cuda.stream(stream):
+                done.record(stream)
+            return _CudaEventWork(done)
+
+        stream.wait_stream(torch.cuda.current_stream(tensor.device))
+        with torch.cuda.stream(stream):
+            flat = tensor.contiguous().view(-1)
+            pad = (world_size - (original_numel % world_size)) % world_size
+            if pad:
+                flat = torch.cat(
+                    [
+                        flat,
+                        torch.zeros(pad, dtype=flat.dtype, device=flat.device),
+                    ],
+                    dim=0,
+                )
+
+            shard_len = flat.numel() // world_size
+            shards = list(flat.split(shard_len))
+            if debug:
+                self._comm_debug(
+                    "lowbit stream allreduce enqueue "
+                    f"numel={original_numel} padded_numel={flat.numel()} "
+                    f"world_size={world_size} shard_len={shard_len} "
+                    f"dtype={flat.dtype} device={flat.device} "
+                    f"block_size={self.block_size} "
+                    f"cuda_kernels={_HAS_CUDA_KERNELS}"
+                )
+
+            send_packed = []
+            send_scales = []
+            for shard in shards:
+                packed, scales, _ = quantize_pack_tensor_blockwise(
+                    shard,
+                    self.bitwidth,
+                    block_size=self.block_size,
+                    stochastic_rounding=self.stochastic_rounding,
+                )
+                send_packed.append(packed)
+                send_scales.append(scales)
+
+            recv_packed = [torch.empty_like(send_packed[0]) for _ in range(world_size)]
+            packed_work = dist.all_to_all(
+                recv_packed,
+                send_packed,
+                group=group,
+                async_op=True,
+            )
+            self._block_work_on_current_stream(packed_work)
+
+            recv_scales = [torch.empty_like(send_scales[0]) for _ in range(world_size)]
+            scales_work = dist.all_to_all(
+                recv_scales,
+                send_scales,
+                group=group,
+                async_op=True,
+            )
+            self._block_work_on_current_stream(scales_work)
+
+            local_sum = torch.zeros(shard_len, dtype=torch.float32, device=flat.device)
+            for src_rank in range(world_size):
+                fp_part = unpack_dequantize_tensor_blockwise(
+                    recv_packed[src_rank],
+                    recv_scales[src_rank],
+                    self.bitwidth,
+                    shard_len,
+                    block_size=self.block_size,
+                    dtype=torch.float32,
+                    device=flat.device,
+                )
+                local_sum.add_(fp_part)
+
+            packed_reduced, reduced_scales, _ = quantize_pack_tensor_blockwise(
+                local_sum,
+                self.bitwidth,
+                block_size=self.block_size,
+                stochastic_rounding=self.stochastic_rounding,
+            )
+
+            gathered_packed = [
+                torch.empty_like(packed_reduced) for _ in range(world_size)
+            ]
+            gather_packed_work = dist.all_gather(
+                gathered_packed,
+                packed_reduced,
+                group=group,
+                async_op=True,
+            )
+            self._block_work_on_current_stream(gather_packed_work)
+
+            gathered_scales = [
+                torch.empty_like(reduced_scales) for _ in range(world_size)
+            ]
+            gather_scales_work = dist.all_gather(
+                gathered_scales,
+                reduced_scales,
+                group=group,
+                async_op=True,
+            )
+            self._block_work_on_current_stream(gather_scales_work)
+
+            out_shards = []
+            for rank_idx in range(world_size):
+                fp_shard = unpack_dequantize_tensor_blockwise(
+                    gathered_packed[rank_idx],
+                    gathered_scales[rank_idx],
+                    self.bitwidth,
+                    shard_len,
+                    block_size=self.block_size,
+                    dtype=torch.float32,
+                    device=flat.device,
+                )
+                out_shards.append(fp_shard)
+
+            restored = torch.cat(out_shards, dim=0)[:original_numel]
+            tensor.copy_(restored.view_as(tensor).to(dtype=tensor.dtype))
+            if post_scale != 1.0:
+                tensor.mul_(post_scale)
+            done.record(stream)
+
+        keepalive = (
+            [flat, local_sum, packed_reduced, reduced_scales, restored]
+            + send_packed
+            + send_scales
+            + recv_packed
+            + recv_scales
+            + gathered_packed
+            + gathered_scales
+            + out_shards
+        )
+        return _CudaEventWork(done, keepalive=keepalive)
 
     def _lowbit_allreduce_via_alltoall_into_(
         self,
