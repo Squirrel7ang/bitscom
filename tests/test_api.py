@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import time
 
 import pytest
 import torch
@@ -13,6 +14,19 @@ class DummyWork:
     def wait(self):
         self.wait_called += 1
         return True
+
+
+class FutureBackedWork:
+    def __init__(self, future):
+        self.future = future
+        self.wait_called = 0
+
+    def get_future(self):
+        return self.future
+
+    def wait(self):
+        self.wait_called += 1
+        return self.future.wait()
 
 
 @pytest.fixture
@@ -141,6 +155,83 @@ def test_lowbit_allreduce_path_uses_alltoall_and_allgather(fake_dist, monkeypatc
     assert "all_to_all" in fake_dist.calls
     assert len(fake_dist.calls["all_to_all"]) == 2
     assert gather_calls["count"] == 2
+
+
+def test_lowbit_allreduce_async_launches_native_collectives(fake_dist, monkeypatch):
+    monkeypatch.delenv("BITSCOM_UNSAFE_FULL_ASYNC_CHAIN", raising=False)
+    monkeypatch.setattr("bitscom.api.dist.get_world_size", lambda group: 2)
+    monkeypatch.setattr("bitscom.api.dist.get_rank", lambda group: 0)
+
+    gather_calls = {"count": 0}
+
+    def fake_all_gather(output_tensor_list, input_tensor, group=None, async_op=False):
+        gather_calls["count"] += 1
+        for out in output_tensor_list:
+            out.copy_(input_tensor)
+        return DummyWork()
+
+    monkeypatch.setattr("bitscom.api.dist.all_gather", fake_all_gather)
+
+    group = LowBitGroup(bitwidth=4, process_group=object())
+    t = torch.tensor([0.0, 1.0], dtype=torch.float32)
+
+    work = group.all_reduce(t, async_op=True)
+
+    assert "all_reduce" not in fake_dist.calls
+    assert "all_to_all" in fake_dist.calls
+    assert len(fake_dist.calls["all_to_all"]) == 2
+    assert all(call["async_op"] is True for call in fake_dist.calls["all_to_all"])
+    assert gather_calls["count"] == 0
+
+    assert work.wait() is True
+    assert gather_calls["count"] == 2
+    assert work.is_completed() is True
+
+
+def test_lowbit_allreduce_async_future_chain_advances_before_wait(fake_dist, monkeypatch):
+    monkeypatch.setenv("BITSCOM_UNSAFE_FULL_ASYNC_CHAIN", "1")
+    monkeypatch.setattr("bitscom.api.dist.get_world_size", lambda group: 2)
+    monkeypatch.setattr("bitscom.api.dist.get_rank", lambda group: 0)
+
+    first_stage_futures = []
+    gather_calls = {"count": 0}
+
+    def fake_all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False):
+        for out, inp in zip(output_tensor_list, input_tensor_list):
+            out.copy_(inp)
+        fut = torch.futures.Future()
+        first_stage_futures.append(fut)
+        return FutureBackedWork(fut)
+
+    def fake_all_gather(output_tensor_list, input_tensor, group=None, async_op=False):
+        gather_calls["count"] += 1
+        for out in output_tensor_list:
+            out.copy_(input_tensor)
+        fut = torch.futures.Future()
+        fut.set_result(True)
+        return FutureBackedWork(fut)
+
+    monkeypatch.setattr("bitscom.api.dist.all_to_all", fake_all_to_all)
+    monkeypatch.setattr("bitscom.api.dist.all_gather", fake_all_gather)
+
+    group = LowBitGroup(bitwidth=4, process_group=object())
+    t = torch.tensor([0.0, 1.0], dtype=torch.float32)
+
+    work = group.all_reduce(t, async_op=True)
+
+    assert len(first_stage_futures) == 2
+    assert gather_calls["count"] == 0
+
+    for fut in first_stage_futures:
+        fut.set_result(True)
+
+    deadline = time.time() + 2.0
+    while gather_calls["count"] < 2 and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert gather_calls["count"] == 2
+    assert work.wait() is True
+    assert work.is_completed() is True
 
 
 def test_lowbit_allreduce_non_sum_falls_back_to_regular_allreduce(fake_dist, monkeypatch):

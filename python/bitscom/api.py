@@ -29,6 +29,228 @@ class _ImmediateWork:
         return True
 
 
+class _NativeLowBitAllReduceWork:
+    """Work-like low-bit all-reduce built from native async collectives."""
+
+    def __init__(
+        self,
+        owner,
+        tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ):
+        self.owner = owner
+        self.tensor = tensor
+        self.group = group
+        self.debug = owner._comm_debug_enabled()
+        self.t0 = time.perf_counter()
+        self.completed = False
+        self.final_future = torch.futures.Future()
+        self._fallback_wait_driven = False
+
+        self.flat = tensor.contiguous().view(-1)
+        self.world_size = dist.get_world_size(group)
+        self.original_numel = int(self.flat.numel())
+        self.empty = self.original_numel == 0
+        if self.empty:
+            self.packed_work = None
+            self.scales_work = None
+            self.completed = True
+            self.final_future.set_result(True)
+            return
+
+        pad = (self.world_size - (self.original_numel % self.world_size)) % self.world_size
+        if pad:
+            self.flat = torch.cat(
+                [
+                    self.flat,
+                    torch.zeros(pad, dtype=self.flat.dtype, device=self.flat.device),
+                ],
+                dim=0,
+            )
+
+        self.shard_len = self.flat.numel() // self.world_size
+        shards = list(self.flat.split(self.shard_len))
+        if self.debug:
+            owner._comm_debug(
+                "lowbit async allreduce start "
+                f"numel={self.original_numel} padded_numel={self.flat.numel()} "
+                f"world_size={self.world_size} shard_len={self.shard_len} "
+                f"dtype={self.flat.dtype} device={self.flat.device} "
+                f"block_size={owner.block_size} cuda_kernels={_HAS_CUDA_KERNELS}"
+            )
+        owner._comm_evidence(
+            "lowbit_allreduce_async_plan",
+            "meaning='bitscom will launch native async collectives for the "
+            "packed low-bit exchange so network communication can overlap "
+            "with caller-side compute before wait()' "
+            f"original_numel={self.original_numel} padded_numel={int(self.flat.numel())} "
+            f"world_size={self.world_size} shard_len={self.shard_len}",
+        )
+
+        self.send_packed = []
+        self.send_scales = []
+        for shard_idx, shard in enumerate(shards):
+            packed, scales, _ = quantize_pack_tensor_blockwise(
+                shard,
+                owner.bitwidth,
+                block_size=owner.block_size,
+                stochastic_rounding=owner.stochastic_rounding,
+            )
+            self.send_packed.append(packed)
+            self.send_scales.append(scales)
+            if self.debug:
+                owner._comm_debug(
+                    f"lowbit async quantize shard={shard_idx} "
+                    f"packed_numel={packed.numel()} scales_numel={scales.numel()}"
+                )
+
+        self.recv_packed = [
+            torch.empty_like(self.send_packed[0]) for _ in range(self.world_size)
+        ]
+        self.recv_scales = [
+            torch.empty_like(self.send_scales[0]) for _ in range(self.world_size)
+        ]
+        self.packed_work = dist.all_to_all(
+            self.recv_packed,
+            self.send_packed,
+            group=group,
+            async_op=True,
+        )
+        self.scales_work = dist.all_to_all(
+            self.recv_scales,
+            self.send_scales,
+            group=group,
+            async_op=True,
+        )
+        self._chain_after_first_collectives()
+
+    @staticmethod
+    def _work_future(work):
+        get_future = getattr(work, "get_future", None)
+        if get_future is None:
+            return None
+        return get_future()
+
+    def _chain_after_first_collectives(self) -> None:
+        if not self.owner._full_async_chain_enabled():
+            self._fallback_wait_driven = True
+            return
+
+        packed_future = self._work_future(self.packed_work)
+        scales_future = self._work_future(self.scales_work)
+        if packed_future is None or scales_future is None:
+            self._fallback_wait_driven = True
+            return
+
+        torch.futures.collect_all([packed_future, scales_future]).then(
+            self._after_first_collectives
+        )
+
+    def _after_first_collectives(self, _future) -> None:
+        try:
+            _future.wait()
+            self._launch_second_collectives()
+        except BaseException as exc:
+            self.final_future.set_exception(exc)
+
+    def _launch_second_collectives(self) -> None:
+        owner = self.owner
+        local_sum = torch.zeros(
+            self.shard_len,
+            dtype=torch.float32,
+            device=self.flat.device,
+        )
+        for src_rank in range(self.world_size):
+            fp_part = unpack_dequantize_tensor_blockwise(
+                self.recv_packed[src_rank],
+                self.recv_scales[src_rank],
+                owner.bitwidth,
+                self.shard_len,
+                block_size=owner.block_size,
+                dtype=torch.float32,
+                device=self.flat.device,
+            )
+            local_sum.add_(fp_part)
+
+        self.packed_reduced, self.reduced_scales, _ = quantize_pack_tensor_blockwise(
+            local_sum,
+            owner.bitwidth,
+            block_size=owner.block_size,
+            stochastic_rounding=owner.stochastic_rounding,
+        )
+        self.gathered_packed = [
+            torch.empty_like(self.packed_reduced) for _ in range(self.world_size)
+        ]
+        self.gathered_scales = [
+            torch.empty_like(self.reduced_scales) for _ in range(self.world_size)
+        ]
+        self.gather_packed_work = dist.all_gather(
+            self.gathered_packed,
+            self.packed_reduced,
+            group=self.group,
+            async_op=True,
+        )
+        self.gather_scales_work = dist.all_gather(
+            self.gathered_scales,
+            self.reduced_scales,
+            group=self.group,
+            async_op=True,
+        )
+        packed_future = self._work_future(self.gather_packed_work)
+        scales_future = self._work_future(self.gather_scales_work)
+        if packed_future is None or scales_future is None:
+            self.gather_packed_work.wait()
+            self.gather_scales_work.wait()
+            self._finalize()
+            return
+
+        torch.futures.collect_all([packed_future, scales_future]).then(
+            self._after_second_collectives
+        )
+
+    def _after_second_collectives(self, _future) -> None:
+        try:
+            _future.wait()
+            self._finalize()
+        except BaseException as exc:
+            self.final_future.set_exception(exc)
+
+    def _finalize(self) -> None:
+        owner = self.owner
+        out_shards = []
+        for rank_idx in range(self.world_size):
+            fp_shard = unpack_dequantize_tensor_blockwise(
+                self.gathered_packed[rank_idx],
+                self.gathered_scales[rank_idx],
+                owner.bitwidth,
+                self.shard_len,
+                block_size=owner.block_size,
+                dtype=torch.float32,
+                device=self.flat.device,
+            )
+            out_shards.append(fp_shard)
+
+        restored = torch.cat(out_shards, dim=0)[: self.original_numel]
+        self.tensor.copy_(restored.view_as(self.tensor).to(dtype=self.tensor.dtype))
+        self.completed = True
+        if self.debug:
+            owner._comm_debug(
+                f"lowbit async allreduce done elapsed_s={time.perf_counter() - self.t0:.3f}"
+            )
+        self.final_future.set_result(True)
+
+    def wait(self):
+        if self._fallback_wait_driven and not self.completed:
+            self.packed_work.wait()
+            self.scales_work.wait()
+            self._launch_second_collectives()
+        self.final_future.wait()
+        return True
+
+    def is_completed(self) -> bool:
+        return self.completed
+
+
 class LowBitGroup:
     """
     对 torch.distributed process_group 的封装，
@@ -95,6 +317,14 @@ class LowBitGroup:
             f"[bitscom-debug rank={rank} bitwidth={self.bitwidth}] {message}",
             flush=True,
         )
+
+    def _full_async_chain_enabled(self) -> bool:
+        return os.environ.get("BITSCOM_UNSAFE_FULL_ASYNC_CHAIN", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def _trace_explain_enabled(self) -> bool:
         return os.environ.get("TRACE_EXPLAIN", "0").lower() in {
@@ -170,15 +400,24 @@ class LowBitGroup:
             # introducing packing/unpacking overhead where bandwidth is not the bottleneck.
             if local_quantize:
                 self._comm_debug("path=local_group_lowbit")
-                flat = tensor.contiguous().view(-1)
-                reduced = self._lowbit_allreduce_via_alltoall_group(flat, local_group).view_as(tensor)
-                tensor.copy_(reduced.to(dtype=tensor.dtype))
+                if async_op:
+                    return self._lowbit_allreduce_via_alltoall_async(
+                        tensor,
+                        local_group,
+                    )
+                self._lowbit_allreduce_via_alltoall_into_(tensor, local_group)
             else:
                 # Single-node topology: local collective does not need compression.
                 self._comm_debug("path=local_group_dense")
-                dist.all_reduce(tensor, op=op, group=local_group)
-            if async_op:
-                return _ImmediateWork()
+                work = dist.all_reduce(
+                    tensor,
+                    op=op,
+                    group=local_group,
+                    async_op=True,
+                )
+                if async_op:
+                    return work
+                work.wait()
             return None
 
         if self._should_use_pipeline_a(op, local_group, inter_group):
@@ -190,6 +429,19 @@ class LowBitGroup:
                 "then local broadcast back to all local ranks' "
                 f"local_quantize={local_quantize} chunk_size={chunk_size}",
             )
+            if async_op:
+                # The flat low-bit path below has native async collectives.
+                # pipeline_a still contains ordered local reduce/barrier/broadcast
+                # phases, so keep its semantics synchronous until it gets a
+                # dedicated native Work implementation.
+                self._hierarchical_lowbit_allreduce_pipeline_a(
+                    tensor,
+                    local_group=local_group,
+                    inter_group=inter_group,
+                    chunk_size=chunk_size,
+                    local_quantize=local_quantize,
+                )
+                return _ImmediateWork()
             self._hierarchical_lowbit_allreduce_pipeline_a(
                 tensor,
                 local_group=local_group,
@@ -197,8 +449,6 @@ class LowBitGroup:
                 chunk_size=chunk_size,
                 local_quantize=local_quantize,
             )
-            if async_op:
-                return _ImmediateWork()
             return None
 
         if self._should_use_lowbit_path(op):
@@ -208,9 +458,9 @@ class LowBitGroup:
                 "meaning='bitscom selected flat low-bit all-reduce over the "
                 "whole process group' implementation=alltoall_quantized",
             )
-            self._lowbit_allreduce_via_alltoall(tensor)
             if async_op:
-                return _ImmediateWork()
+                return self._lowbit_allreduce_via_alltoall_async(tensor, self.pg)
+            self._lowbit_allreduce_via_alltoall(tensor)
             return None
 
         if self.simulate_quantization:
@@ -725,8 +975,22 @@ class LowBitGroup:
             self._comm_debug("pipeline_a done")
 
     def _lowbit_allreduce_via_alltoall(self, tensor: torch.Tensor) -> None:
+        self._lowbit_allreduce_via_alltoall_into_(tensor, self.pg)
+
+    def _lowbit_allreduce_via_alltoall_async(
+        self,
+        tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ):
+        return _NativeLowBitAllReduceWork(self, tensor, group)
+
+    def _lowbit_allreduce_via_alltoall_into_(
+        self,
+        tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> None:
         flat = tensor.contiguous().view(-1)
-        restored = self._lowbit_allreduce_via_alltoall_group(flat, self.pg).view_as(tensor)
+        restored = self._lowbit_allreduce_via_alltoall_group(flat, group).view_as(tensor)
         tensor.copy_(restored.to(dtype=tensor.dtype))
 
     def all_gather(
