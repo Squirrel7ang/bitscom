@@ -274,7 +274,7 @@ std::pair<at::Tensor, double> quantize_cuda(
     int64_t n = flat.numel();
     int threads = 256;
     int blocks = static_cast<int>((n + threads - 1) / threads);
-    auto stream = at::cuda::getDefaultCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     uint64_t seed = static_cast<uint64_t>(
         std::chrono::high_resolution_clock::now().time_since_epoch().count());
@@ -307,7 +307,7 @@ at::Tensor dequantize_cuda(
     int64_t n = flat.numel();
     int threads = 256;
     int blocks = static_cast<int>((n + threads - 1) / threads);
-    auto stream = at::cuda::getDefaultCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     dequantize_kernel<<<blocks, threads, 0, stream>>>(
         flat.data_ptr<int16_t>(),
@@ -340,7 +340,7 @@ at::Tensor pack_lowbit_cuda(
 
     int threads = 256;
     int blocks = static_cast<int>((num_bytes + threads - 1) / threads);
-    auto stream = at::cuda::getDefaultCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     pack_lowbit_kernel<<<blocks, threads, 0, stream>>>(
         flat.data_ptr<int16_t>(),
@@ -370,7 +370,7 @@ at::Tensor unpack_lowbit_cuda(
 
     int threads = 256;
     int blocks = static_cast<int>((numel + threads - 1) / threads);
-    auto stream = at::cuda::getDefaultCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     unpack_lowbit_kernel<<<blocks, threads, 0, stream>>>(
         packed.contiguous().data_ptr<uint8_t>(),
@@ -416,7 +416,7 @@ std::tuple<at::Tensor, at::Tensor, int64_t> blockwise_quantize_pack_cuda(
     int qmin = bounds.first;
     int qmax = bounds.second;
     int threads = 256;
-    auto stream = at::cuda::getDefaultCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     uint64_t seed = static_cast<uint64_t>(
         std::chrono::high_resolution_clock::now().time_since_epoch().count());
@@ -479,7 +479,7 @@ at::Tensor blockwise_unpack_dequantize_cuda(
     int qmin = bounds.first;
     int threads = 256;
     int blocks = static_cast<int>((numel + threads - 1) / threads);
-    auto stream = at::cuda::getDefaultCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto packed_contig = packed.contiguous();
     auto scales_contig = scales.contiguous();
 
