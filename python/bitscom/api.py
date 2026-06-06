@@ -31,6 +31,14 @@ def _bitscom_timing_enabled() -> bool:
     }
 
 
+def _bitscom_timing_rank_enabled(rank: int) -> bool:
+    ranks = os.environ.get("BITSCOM_TIMING_RANKS")
+    if not ranks:
+        return True
+    allowed = {item.strip() for item in ranks.split(",") if item.strip()}
+    return "all" in allowed or str(rank) in allowed
+
+
 def _bitscom_timing(message: str) -> None:
     if not _bitscom_timing_enabled():
         return
@@ -38,10 +46,19 @@ def _bitscom_timing(message: str) -> None:
         rank = dist.get_rank()
     except Exception:
         rank = -1
-    print(
-        f"[bitscom-timing rank={rank} t={time.time():.6f}] {message}",
-        flush=True,
-    )
+    if not _bitscom_timing_rank_enabled(rank):
+        return
+    line = f"[bitscom-timing rank={rank} t={time.time():.6f}] {message}"
+    log_file = os.environ.get("BITSCOM_TIMING_FILE")
+    if log_file:
+        log_file = log_file.format(rank=rank)
+        directory = os.path.dirname(log_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return
+    print(line, flush=True)
 
 
 class _ImmediateWork:
