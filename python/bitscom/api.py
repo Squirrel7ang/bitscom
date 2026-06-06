@@ -22,6 +22,28 @@ from .quantization import (
 )
 
 
+def _bitscom_timing_enabled() -> bool:
+    return os.environ.get("BITSCOM_TIMING", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _bitscom_timing(message: str) -> None:
+    if not _bitscom_timing_enabled():
+        return
+    try:
+        rank = dist.get_rank()
+    except Exception:
+        rank = -1
+    print(
+        f"[bitscom-timing rank={rank} t={time.time():.6f}] {message}",
+        flush=True,
+    )
+
+
 class _ImmediateWork:
     """Simple Work-like object for sync-completed Python collectives."""
 
@@ -572,15 +594,25 @@ class LowBitGroup:
     @staticmethod
     def _block_work_on_current_stream(work) -> None:
         if hasattr(work, "block_current_stream"):
+            t0 = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_block_work_on_current_stream:block_current_stream"
             ):
                 work.block_current_stream()
+            _bitscom_timing(
+                "block_work_on_current_stream block_current_stream returned "
+                f"elapsed_ms={(time.perf_counter() - t0) * 1000.0:.3f}"
+            )
         else:
+            t0 = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_block_work_on_current_stream:fallback_wait"
             ):
                 work.wait()
+            _bitscom_timing(
+                "block_work_on_current_stream fallback_wait returned "
+                f"elapsed_ms={(time.perf_counter() - t0) * 1000.0:.3f}"
+            )
 
     def _should_use_pipeline_a(
         self,
@@ -1093,18 +1125,35 @@ class LowBitGroup:
         stream: torch.cuda.Stream,
         post_scale: float,
     ):
+        func_t0 = time.perf_counter()
         debug = self._comm_debug_enabled()
         world_size = dist.get_world_size(group)
         original_numel = int(tensor.numel())
         done = torch.cuda.Event()
+        _bitscom_timing(
+            "lowbit_stream enter "
+            f"numel={original_numel} world_size={world_size} "
+            f"dtype={tensor.dtype} device={tensor.device}"
+        )
         if original_numel == 0:
             stream.wait_stream(torch.cuda.current_stream(tensor.device))
             with torch.cuda.stream(stream):
                 done.record(stream)
+            _bitscom_timing(
+                "lowbit_stream empty exit "
+                f"elapsed_ms={(time.perf_counter() - func_t0) * 1000.0:.3f}"
+            )
             return _CudaEventWork(done)
 
+        t_wait_stream = time.perf_counter()
         stream.wait_stream(torch.cuda.current_stream(tensor.device))
+        _bitscom_timing(
+            "lowbit_stream wait_stream returned "
+            f"elapsed_ms={(time.perf_counter() - t_wait_stream) * 1000.0:.3f}"
+        )
         with torch.cuda.stream(stream):
+            stream_body_t0 = time.perf_counter()
+            t_layout = time.perf_counter()
             flat = tensor.contiguous().view(-1)
             pad = (world_size - (original_numel % world_size)) % world_size
             if pad:
@@ -1118,6 +1167,11 @@ class LowBitGroup:
 
             shard_len = flat.numel() // world_size
             shards = list(flat.split(shard_len))
+            _bitscom_timing(
+                "lowbit_stream stage=layout returned "
+                f"padded_numel={int(flat.numel())} shard_len={int(shard_len)} "
+                f"elapsed_ms={(time.perf_counter() - t_layout) * 1000.0:.3f}"
+            )
             if debug:
                 self._comm_debug(
                     "lowbit stream allreduce enqueue "
@@ -1130,6 +1184,7 @@ class LowBitGroup:
 
             send_packed = []
             send_scales = []
+            t_quantize_send = time.perf_counter()
             for shard in shards:
                 packed, scales, _ = quantize_pack_tensor_blockwise(
                     shard,
@@ -1139,8 +1194,14 @@ class LowBitGroup:
                 )
                 send_packed.append(packed)
                 send_scales.append(scales)
+            _bitscom_timing(
+                "lowbit_stream stage=quantize_send returned "
+                f"chunks={len(send_packed)} "
+                f"elapsed_ms={(time.perf_counter() - t_quantize_send) * 1000.0:.3f}"
+            )
 
             recv_packed = [torch.empty_like(send_packed[0]) for _ in range(world_size)]
+            t_launch = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_lowbit_stream:launch_all_to_all_packed"
             ):
@@ -1150,12 +1211,22 @@ class LowBitGroup:
                     group=group,
                     async_op=True,
                 )
+            _bitscom_timing(
+                "lowbit_stream stage=launch_all_to_all_packed returned "
+                f"elapsed_ms={(time.perf_counter() - t_launch) * 1000.0:.3f}"
+            )
+            t_block = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_lowbit_stream:block_all_to_all_packed"
             ):
                 self._block_work_on_current_stream(packed_work)
+            _bitscom_timing(
+                "lowbit_stream stage=block_all_to_all_packed returned "
+                f"elapsed_ms={(time.perf_counter() - t_block) * 1000.0:.3f}"
+            )
 
             recv_scales = [torch.empty_like(send_scales[0]) for _ in range(world_size)]
+            t_launch = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_lowbit_stream:launch_all_to_all_scales"
             ):
@@ -1165,11 +1236,21 @@ class LowBitGroup:
                     group=group,
                     async_op=True,
                 )
+            _bitscom_timing(
+                "lowbit_stream stage=launch_all_to_all_scales returned "
+                f"elapsed_ms={(time.perf_counter() - t_launch) * 1000.0:.3f}"
+            )
+            t_block = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_lowbit_stream:block_all_to_all_scales"
             ):
                 self._block_work_on_current_stream(scales_work)
+            _bitscom_timing(
+                "lowbit_stream stage=block_all_to_all_scales returned "
+                f"elapsed_ms={(time.perf_counter() - t_block) * 1000.0:.3f}"
+            )
 
+            t_reduce = time.perf_counter()
             local_sum = torch.zeros(shard_len, dtype=torch.float32, device=flat.device)
             for src_rank in range(world_size):
                 fp_part = unpack_dequantize_tensor_blockwise(
@@ -1182,17 +1263,27 @@ class LowBitGroup:
                     device=flat.device,
                 )
                 local_sum.add_(fp_part)
+            _bitscom_timing(
+                "lowbit_stream stage=unpack_reduce returned "
+                f"elapsed_ms={(time.perf_counter() - t_reduce) * 1000.0:.3f}"
+            )
 
+            t_requantize = time.perf_counter()
             packed_reduced, reduced_scales, _ = quantize_pack_tensor_blockwise(
                 local_sum,
                 self.bitwidth,
                 block_size=self.block_size,
                 stochastic_rounding=self.stochastic_rounding,
             )
+            _bitscom_timing(
+                "lowbit_stream stage=quantize_reduced returned "
+                f"elapsed_ms={(time.perf_counter() - t_requantize) * 1000.0:.3f}"
+            )
 
             gathered_packed = [
                 torch.empty_like(packed_reduced) for _ in range(world_size)
             ]
+            t_launch = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_lowbit_stream:launch_all_gather_packed"
             ):
@@ -1202,14 +1293,24 @@ class LowBitGroup:
                     group=group,
                     async_op=True,
                 )
+            _bitscom_timing(
+                "lowbit_stream stage=launch_all_gather_packed returned "
+                f"elapsed_ms={(time.perf_counter() - t_launch) * 1000.0:.3f}"
+            )
+            t_block = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_lowbit_stream:block_all_gather_packed"
             ):
                 self._block_work_on_current_stream(gather_packed_work)
+            _bitscom_timing(
+                "lowbit_stream stage=block_all_gather_packed returned "
+                f"elapsed_ms={(time.perf_counter() - t_block) * 1000.0:.3f}"
+            )
 
             gathered_scales = [
                 torch.empty_like(reduced_scales) for _ in range(world_size)
             ]
+            t_launch = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_lowbit_stream:launch_all_gather_scales"
             ):
@@ -1219,12 +1320,22 @@ class LowBitGroup:
                     group=group,
                     async_op=True,
                 )
+            _bitscom_timing(
+                "lowbit_stream stage=launch_all_gather_scales returned "
+                f"elapsed_ms={(time.perf_counter() - t_launch) * 1000.0:.3f}"
+            )
+            t_block = time.perf_counter()
             with torch.profiler.record_function(
                 "bitscom:_lowbit_stream:block_all_gather_scales"
             ):
                 self._block_work_on_current_stream(gather_scales_work)
+            _bitscom_timing(
+                "lowbit_stream stage=block_all_gather_scales returned "
+                f"elapsed_ms={(time.perf_counter() - t_block) * 1000.0:.3f}"
+            )
 
             out_shards = []
+            t_unpack_gathered = time.perf_counter()
             for rank_idx in range(world_size):
                 fp_shard = unpack_dequantize_tensor_blockwise(
                     gathered_packed[rank_idx],
@@ -1236,13 +1347,32 @@ class LowBitGroup:
                     device=flat.device,
                 )
                 out_shards.append(fp_shard)
+            _bitscom_timing(
+                "lowbit_stream stage=unpack_gathered returned "
+                f"elapsed_ms={(time.perf_counter() - t_unpack_gathered) * 1000.0:.3f}"
+            )
 
+            t_restore = time.perf_counter()
             restored = torch.cat(out_shards, dim=0)[:original_numel]
             tensor.copy_(restored.view_as(tensor).to(dtype=tensor.dtype))
             if post_scale != 1.0:
                 tensor.mul_(post_scale)
+            _bitscom_timing(
+                "lowbit_stream stage=restore_tensor returned "
+                f"elapsed_ms={(time.perf_counter() - t_restore) * 1000.0:.3f}"
+            )
+            t_done_record = time.perf_counter()
             done.record(stream)
+            _bitscom_timing(
+                "lowbit_stream stage=done_record returned "
+                f"elapsed_ms={(time.perf_counter() - t_done_record) * 1000.0:.3f}"
+            )
+            _bitscom_timing(
+                "lowbit_stream stream-body exit "
+                f"elapsed_ms={(time.perf_counter() - stream_body_t0) * 1000.0:.3f}"
+            )
 
+        t_keepalive = time.perf_counter()
         keepalive = (
             [flat, local_sum, packed_reduced, reduced_scales, restored]
             + send_packed
@@ -1252,6 +1382,14 @@ class LowBitGroup:
             + gathered_packed
             + gathered_scales
             + out_shards
+        )
+        _bitscom_timing(
+            "lowbit_stream keepalive built "
+            f"elapsed_ms={(time.perf_counter() - t_keepalive) * 1000.0:.3f}"
+        )
+        _bitscom_timing(
+            "lowbit_stream exit "
+            f"elapsed_ms={(time.perf_counter() - func_t0) * 1000.0:.3f}"
         )
         return _CudaEventWork(done, keepalive=keepalive)
 
