@@ -441,8 +441,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
                 getRank(),
                 std::string("launcher task complete success=") + (success ? "true" : "false"));
             work->markCompleted(success);
+        } catch (const std::exception& e) {
+            lowbitBackendTiming(
+                this,
+                getRank(),
+                std::string("launcher task failed exception=") + e.what());
+            work->markFailed(std::current_exception());
         } catch (...) {
-            lowbitBackendTiming(this, getRank(), "launcher task failed");
+            lowbitBackendTiming(this, getRank(), "launcher task failed unknown exception");
             work->markFailed(std::current_exception());
         }
     });
@@ -593,8 +599,24 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
             residual_cache_[key] = new_residual;
         }
 
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "phase1 packed alltoall enter tensor_numel=" + std::to_string(s.flat.numel()));
         phase1_works.push_back(nccl_pg_->alltoall(s.recv_packed, s.send_packed, alltoall_opts));
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "phase1 packed alltoall returned tensor_numel=" + std::to_string(s.flat.numel()));
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "phase1 scales alltoall enter tensor_numel=" + std::to_string(s.flat.numel()));
         phase1_works.push_back(nccl_pg_->alltoall(s.recv_scales, s.send_scales, alltoall_opts));
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "phase1 scales alltoall returned tensor_numel=" + std::to_string(s.flat.numel()));
         lowbitBackendTiming(
             this,
             getRank(),
