@@ -101,8 +101,10 @@ void checkCuda(cudaError_t err, const char* what) {
 
 struct CudaEventHandle {
     cudaEvent_t event = nullptr;
+    int device_index = -1;
 
-    CudaEventHandle() {
+    explicit CudaEventHandle(int device) : device_index(device) {
+        c10::cuda::CUDAGuard device_guard(device_index);
         checkCuda(
             cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
             "cudaEventCreateWithFlags");
@@ -110,6 +112,7 @@ struct CudaEventHandle {
 
     ~CudaEventHandle() {
         if (event != nullptr) {
+            c10::cuda::CUDAGuard device_guard(device_index);
             cudaEventDestroy(event);
         }
     }
@@ -407,8 +410,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     std::shared_ptr<CudaEventHandle> ready_event;
     if (!tensors.empty() && tensors[0].defined() && tensors[0].is_cuda()) {
         device_index = tensors[0].device().index();
+        c10::cuda::CUDAGuard device_guard(*device_index);
         auto producer_stream = c10::cuda::getCurrentCUDAStream(*device_index);
-        ready_event = std::make_shared<CudaEventHandle>();
+        ready_event = std::make_shared<CudaEventHandle>(*device_index);
         checkCuda(
             cudaEventRecord(ready_event->event, producer_stream.stream()),
             "cudaEventRecord");
@@ -462,6 +466,7 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
     std::shared_ptr<CudaEventHandle> ready_event) {
     std::optional<c10::cuda::CUDAStream> launcher_stream;
     if (device_index.has_value()) {
+        c10::cuda::CUDAGuard device_guard(*device_index);
         launcher_stream = getLauncherStream(*device_index);
         checkCuda(
             cudaStreamWaitEvent(launcher_stream->stream(), ready_event->event, 0),
@@ -775,6 +780,7 @@ void ProcessGroupLowBit::launcherLoop() {
 }
 
 c10::cuda::CUDAStream ProcessGroupLowBit::getLauncherStream(int device_index) {
+    c10::cuda::CUDAGuard device_guard(device_index);
     auto it = launcher_streams_.find(device_index);
     if (it != launcher_streams_.end()) {
         return *(it->second);
