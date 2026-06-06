@@ -14,6 +14,7 @@
 #include <iostream>
 #include <sstream>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace bitscom {
 
@@ -74,12 +75,16 @@ void ensureTimingDir() {
     mkdir("debug_logs/timing", 0755);
 }
 
-void lowbitBackendTiming(int rank, const std::string& message) {
+void lowbitBackendTiming(const void* pg, int rank, const std::string& message) {
     ensureTimingDir();
+    const auto pid = static_cast<long long>(getpid());
     std::ostringstream path;
-    path << "debug_logs/timing/lowbit_backend_rank" << rank << ".log";
+    path << "debug_logs/timing/lowbit_backend_pid" << pid << "_rank" << rank << ".log";
     std::ofstream out(path.str(), std::ios::app);
-    out << "[lowbit-backend-timing rank=" << rank
+    out << "[lowbit-backend-timing pid=" << pid
+        << " rank=" << rank
+        << " pg=" << pg
+        << " tid=" << std::this_thread::get_id()
         << " t=" << std::fixed << std::setprecision(6) << nowSeconds()
         << "] " << message << "\n";
 }
@@ -217,11 +222,18 @@ ProcessGroupLowBit::ProcessGroupLowBit(
               << " bitwidth=" << options_.bitwidth
               << " error_feedback=" << errorFeedbackModeName(error_feedback_mode_)
               << std::endl;
+    lowbitBackendTiming(
+        this,
+        getRank(),
+        "ProcessGroupLowBit created size=" + std::to_string(size) +
+            " bitwidth=" + std::to_string(options_.bitwidth) +
+            " error_feedback=" + errorFeedbackModeName(error_feedback_mode_));
 
     launcher_thread_ = std::thread(&ProcessGroupLowBit::launcherLoop, this);
 }
 
 ProcessGroupLowBit::~ProcessGroupLowBit() {
+    lowbitBackendTiming(this, getRank(), "ProcessGroupLowBit destructor enter");
     {
         std::lock_guard<std::mutex> lock(launcher_mutex_);
         launcher_shutdown_ = true;
@@ -230,6 +242,7 @@ ProcessGroupLowBit::~ProcessGroupLowBit() {
     if (launcher_thread_.joinable()) {
         launcher_thread_.join();
     }
+    lowbitBackendTiming(this, getRank(), "ProcessGroupLowBit destructor exit");
 }
 
 // ---- pack/unpack 占位实现 ----
@@ -368,19 +381,21 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
         stream = c10::cuda::getCurrentCUDAStream(tensors[0].device().index());
     }
     lowbitBackendTiming(
+        this,
         getRank(),
         "allreduceLowBit enqueue tensors=" + std::to_string(tensors.size()) +
             (tensors.empty() ? "" : " numel=" + std::to_string(tensors[0].numel())));
     enqueueLowBitTask([this, tensors_copy = std::move(tensors_copy), opts, stream, work]() mutable {
         try {
-            lowbitBackendTiming(getRank(), "launcher task enter");
+            lowbitBackendTiming(this, getRank(), "launcher task enter");
             bool success = runLowBitAllreduce(std::move(tensors_copy), opts, stream);
             lowbitBackendTiming(
+                this,
                 getRank(),
                 std::string("launcher task complete success=") + (success ? "true" : "false"));
             work->markCompleted(success);
         } catch (...) {
-            lowbitBackendTiming(getRank(), "launcher task failed");
+            lowbitBackendTiming(this, getRank(), "launcher task failed");
             work->markFailed(std::current_exception());
         }
     });
@@ -393,6 +408,7 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
     std::optional<c10::cuda::CUDAStream> stream) {
     c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
     lowbitBackendTiming(
+        this,
         getRank(),
         "runLowBitAllreduce enter tensors=" + std::to_string(tensors.size()));
 
@@ -400,6 +416,7 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
         auto work = nccl_pg_->allreduce(tensors, opts);
         bool success = work->wait();
         lowbitBackendTiming(
+            this,
             getRank(),
             std::string("runLowBitAllreduce empty done success=") +
                 (success ? "true" : "false"));
@@ -507,6 +524,7 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
         phase1_works.push_back(nccl_pg_->alltoall(s.recv_packed, s.send_packed, alltoall_opts));
         phase1_works.push_back(nccl_pg_->alltoall(s.recv_scales, s.send_scales, alltoall_opts));
         lowbitBackendTiming(
+            this,
             getRank(),
             "phase1 alltoall launched tensor_numel=" + std::to_string(s.flat.numel()));
 
@@ -514,14 +532,14 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
     }
 
     auto post_hook = [this, state, phase1_works, world_size, rank, stage2_ef]() mutable -> bool {
-        lowbitBackendTiming(getRank(), "phase1 wait enter works=" + std::to_string(phase1_works.size()));
+        lowbitBackendTiming(this, getRank(), "phase1 wait enter works=" + std::to_string(phase1_works.size()));
         for (auto& w : phase1_works) {
             if (!w->wait()) {
-                lowbitBackendTiming(getRank(), "phase1 wait failed");
+                lowbitBackendTiming(this, getRank(), "phase1 wait failed");
                 return false;
             }
         }
-        lowbitBackendTiming(getRank(), "phase1 wait done");
+        lowbitBackendTiming(this, getRank(), "phase1 wait done");
 
         c10d::AllgatherOptions allgather_opts;
         for (auto& s : *state) {
@@ -583,12 +601,12 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
 
             std::vector<at::Tensor> packed_input = {reduced_packed};
             auto wg_packed = nccl_pg_->allgather(gathered_packed, packed_input, allgather_opts);
-            lowbitBackendTiming(getRank(), "allgather packed launched");
+            lowbitBackendTiming(this, getRank(), "allgather packed launched");
             if (!wg_packed->wait()) {
-                lowbitBackendTiming(getRank(), "allgather packed wait failed");
+                lowbitBackendTiming(this, getRank(), "allgather packed wait failed");
                 return false;
             }
-            lowbitBackendTiming(getRank(), "allgather packed wait done");
+            lowbitBackendTiming(this, getRank(), "allgather packed wait done");
 
             std::vector<std::vector<at::Tensor>> gathered_scales(1);
             gathered_scales[0].reserve(world_size);
@@ -598,12 +616,12 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
 
             std::vector<at::Tensor> scale_input = {reduced_scale};
             auto wg_scale = nccl_pg_->allgather(gathered_scales, scale_input, allgather_opts);
-            lowbitBackendTiming(getRank(), "allgather scales launched");
+            lowbitBackendTiming(this, getRank(), "allgather scales launched");
             if (!wg_scale->wait()) {
-                lowbitBackendTiming(getRank(), "allgather scales wait failed");
+                lowbitBackendTiming(this, getRank(), "allgather scales wait failed");
                 return false;
             }
-            lowbitBackendTiming(getRank(), "allgather scales wait done");
+            lowbitBackendTiming(this, getRank(), "allgather scales wait done");
 
             std::vector<at::Tensor> out_shards;
             out_shards.reserve(world_size);
@@ -619,7 +637,7 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
 
             auto restored = at::cat(out_shards, 0).view_as(s.original).to(s.original.scalar_type());
             s.original.copy_(restored);
-            lowbitBackendTiming(getRank(), "restore done tensor_numel=" + std::to_string(s.flat.numel()));
+            lowbitBackendTiming(this, getRank(), "restore done tensor_numel=" + std::to_string(s.flat.numel()));
         }
         return true;
     };
@@ -628,10 +646,13 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
 }
 
 void ProcessGroupLowBit::enqueueLowBitTask(std::function<void()> task) {
+    size_t queue_size = 0;
     {
         std::lock_guard<std::mutex> lock(launcher_mutex_);
         launcher_queue_.push_back(std::move(task));
+        queue_size = launcher_queue_.size();
     }
+    lowbitBackendTiming(this, getRank(), "enqueueLowBitTask queued queue_size=" + std::to_string(queue_size));
     launcher_cv_.notify_one();
 }
 
@@ -648,6 +669,7 @@ void ProcessGroupLowBit::launcherLoop() {
             }
             task = std::move(launcher_queue_.front());
             launcher_queue_.pop_front();
+            lowbitBackendTiming(this, getRank(), "launcher pop queue_remaining=" + std::to_string(launcher_queue_.size()));
         }
         task();
     }
