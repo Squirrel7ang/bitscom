@@ -23,20 +23,26 @@ from .quantization import (
 
 
 def _bitscom_timing_enabled() -> bool:
-    return os.environ.get("BITSCOM_TIMING", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return True
 
 
-def _bitscom_timing_rank_enabled(rank: int) -> bool:
-    ranks = os.environ.get("BITSCOM_TIMING_RANKS")
-    if not ranks:
-        return True
-    allowed = {item.strip() for item in ranks.split(",") if item.strip()}
-    return "all" in allowed or str(rank) in allowed
+def _bitscom_timing_log_dir() -> str:
+    directory = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if (
+            os.path.isdir(os.path.join(directory, "polar-sgd"))
+            and os.path.isdir(os.path.join(directory, "bitscom"))
+        ):
+            root = directory
+            break
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            root = os.getcwd()
+            break
+        directory = parent
+    log_dir = os.path.join(root, "debug_logs", "timing")
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
 
 
 def _bitscom_timing(message: str) -> None:
@@ -46,19 +52,10 @@ def _bitscom_timing(message: str) -> None:
         rank = dist.get_rank()
     except Exception:
         rank = -1
-    if not _bitscom_timing_rank_enabled(rank):
-        return
     line = f"[bitscom-timing rank={rank} t={time.time():.6f}] {message}"
-    log_file = os.environ.get("BITSCOM_TIMING_FILE")
-    if log_file:
-        log_file = log_file.format(rank=rank)
-        directory = os.path.dirname(log_file)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        return
-    print(line, flush=True)
+    log_file = os.path.join(_bitscom_timing_log_dir(), f"bitscom_rank{rank}.log")
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
 class _ImmediateWork:
@@ -1157,7 +1154,7 @@ class LowBitGroup:
             with torch.cuda.stream(stream):
                 done.record(stream)
             _bitscom_timing(
-                "lowbit_stream empty exit "
+                "SUMMARY lowbit_stream empty exit "
                 f"elapsed_ms={(time.perf_counter() - func_t0) * 1000.0:.3f}"
             )
             return _CudaEventWork(done)
@@ -1405,7 +1402,7 @@ class LowBitGroup:
             f"elapsed_ms={(time.perf_counter() - t_keepalive) * 1000.0:.3f}"
         )
         _bitscom_timing(
-            "lowbit_stream exit "
+            "SUMMARY lowbit_stream exit "
             f"elapsed_ms={(time.perf_counter() - func_t0) * 1000.0:.3f}"
         )
         return _CudaEventWork(done, keepalive=keepalive)
