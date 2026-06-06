@@ -3,7 +3,10 @@ High-level API for low-bit distributed communication.
 """
 
 import os
+import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Optional, List
 
 import torch
@@ -86,6 +89,114 @@ class _CudaEventWork:
 
     def is_completed(self) -> bool:
         return bool(self.event.query())
+
+
+class _WorkBitscom:
+    """Work-like handle whose bitscom launch is driven by a background launcher."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._inner_work = None
+        self._exc: Optional[BaseException] = None
+
+    def _set_inner_work(self, work) -> None:
+        with self._cv:
+            self._inner_work = work
+            self._cv.notify_all()
+
+    def _set_exception(self, exc: BaseException) -> None:
+        with self._cv:
+            self._exc = exc
+            self._cv.notify_all()
+
+    def _wait_for_inner_work(self):
+        with self._cv:
+            while self._inner_work is None and self._exc is None:
+                self._cv.wait()
+            if self._exc is not None:
+                raise self._exc
+            return self._inner_work
+
+    def wait(self):
+        work = self._wait_for_inner_work()
+        return work.wait()
+
+    def block_current_stream(self):
+        work = self._wait_for_inner_work()
+        if hasattr(work, "block_current_stream"):
+            return work.block_current_stream()
+        return work.wait()
+
+    def is_completed(self) -> bool:
+        with self._cv:
+            if self._exc is not None:
+                raise self._exc
+            work = self._inner_work
+        if work is None:
+            return False
+        is_completed = getattr(work, "is_completed", None)
+        if is_completed is None:
+            return False
+        return bool(is_completed())
+
+
+@dataclass
+class _BitscomLaunchTask:
+    owner: "LowBitGroup"
+    tensor: torch.Tensor
+    group: dist.ProcessGroup
+    stream: torch.cuda.Stream
+    post_scale: float
+    work: _WorkBitscom
+
+
+class _BitscomAsyncLauncher:
+    """Per-process-group FIFO launcher for low-bit stream all-reduce tasks."""
+
+    _launchers = {}
+    _launchers_lock = threading.Lock()
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._queue = deque()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="bitscom-async-launcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @classmethod
+    def for_group(cls, group: dist.ProcessGroup) -> "_BitscomAsyncLauncher":
+        key = id(group)
+        with cls._launchers_lock:
+            launcher = cls._launchers.get(key)
+            if launcher is None:
+                launcher = cls()
+                cls._launchers[key] = launcher
+            return launcher
+
+    def submit(self, task: _BitscomLaunchTask) -> None:
+        with self._cv:
+            self._queue.append(task)
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._queue:
+                    self._cv.wait()
+                task = self._queue.popleft()
+            try:
+                inner_work = task.owner._lowbit_allreduce_via_alltoall_stream_(
+                    task.tensor,
+                    task.group,
+                    stream=task.stream,
+                    post_scale=task.post_scale,
+                )
+                task.work._set_inner_work(inner_work)
+            except BaseException as exc:
+                task.work._set_exception(exc)
 
 
 class _NativeLowBitAllReduceWork:
@@ -544,10 +655,9 @@ class LowBitGroup:
     ):
         """Launch a low-bit all-reduce as a stream-ordered CUDA workload.
 
-        This path keeps the whole low-bit sequence on one caller-provided
-        stream: pack, all-to-all, unpack/reduce, repack, all-gather, final
-        unpack/copy. It returns an event-backed Work; callers can delay
-        waiting until the reduced tensor is actually needed.
+        The low-bit path returns after enqueueing a per-process-group FIFO
+        launcher task. The launcher then submits the full bitscom pipeline onto
+        the caller-provided stream and publishes an event-backed inner Work.
         """
         process_group = group or self.pg
         if op != dist.ReduceOp.SUM or not self._should_use_lowbit_path_for_group(
@@ -580,12 +690,24 @@ class LowBitGroup:
                 tensor.mul_(post_scale)
             return _ImmediateWork()
 
-        return self._lowbit_allreduce_via_alltoall_stream_(
-            tensor,
-            process_group,
+        t_submit = time.perf_counter()
+        stream.wait_stream(torch.cuda.current_stream(tensor.device))
+        work = _WorkBitscom()
+        task = _BitscomLaunchTask(
+            owner=self,
+            tensor=tensor,
+            group=process_group,
             stream=stream,
             post_scale=post_scale,
+            work=work,
         )
+        _BitscomAsyncLauncher.for_group(process_group).submit(task)
+        _bitscom_timing(
+            "lowbit_stream async-submit returned "
+            f"numel={int(tensor.numel())} "
+            f"elapsed_ms={(time.perf_counter() - t_submit) * 1000.0:.3f}"
+        )
+        return work
 
     def _should_use_lowbit_path(self, op: dist.ReduceOp) -> bool:
         return (
