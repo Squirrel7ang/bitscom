@@ -89,7 +89,34 @@ void lowbitBackendTiming(const void* pg, int rank, const std::string& message) {
         << "] " << message << "\n";
 }
 
+void checkCuda(cudaError_t err, const char* what) {
+    TORCH_CHECK(
+        err == cudaSuccess,
+        what,
+        " failed: ",
+        cudaGetErrorString(err));
+}
+
 }  // namespace
+
+struct CudaEventHandle {
+    cudaEvent_t event = nullptr;
+
+    CudaEventHandle() {
+        checkCuda(
+            cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+            "cudaEventCreateWithFlags");
+    }
+
+    ~CudaEventHandle() {
+        if (event != nullptr) {
+            cudaEventDestroy(event);
+        }
+    }
+
+    CudaEventHandle(const CudaEventHandle&) = delete;
+    CudaEventHandle& operator=(const CudaEventHandle&) = delete;
+};
 
 // ==================== WorkLowBit ====================
 
@@ -376,19 +403,39 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     const c10d::AllreduceOptions& opts) {
     auto work = c10::make_intrusive<WorkBitscom>();
     std::vector<at::Tensor> tensors_copy = tensors;
-    std::optional<c10::cuda::CUDAStream> stream;
+    std::optional<int> device_index;
+    std::shared_ptr<CudaEventHandle> ready_event;
     if (!tensors.empty() && tensors[0].defined() && tensors[0].is_cuda()) {
-        stream = c10::cuda::getCurrentCUDAStream(tensors[0].device().index());
+        device_index = tensors[0].device().index();
+        auto producer_stream = c10::cuda::getCurrentCUDAStream(*device_index);
+        ready_event = std::make_shared<CudaEventHandle>();
+        checkCuda(
+            cudaEventRecord(ready_event->event, producer_stream.stream()),
+            "cudaEventRecord");
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "producer ready event recorded device=" + std::to_string(*device_index));
     }
     lowbitBackendTiming(
         this,
         getRank(),
         "allreduceLowBit enqueue tensors=" + std::to_string(tensors.size()) +
-            (tensors.empty() ? "" : " numel=" + std::to_string(tensors[0].numel())));
-    enqueueLowBitTask([this, tensors_copy = std::move(tensors_copy), opts, stream, work]() mutable {
+            (tensors.empty() ? "" : " numel=" + std::to_string(tensors[0].numel())) +
+            (device_index.has_value() ? " device=" + std::to_string(*device_index) : ""));
+    enqueueLowBitTask([this,
+                       tensors_copy = std::move(tensors_copy),
+                       opts,
+                       device_index,
+                       ready_event = std::move(ready_event),
+                       work]() mutable {
         try {
             lowbitBackendTiming(this, getRank(), "launcher task enter");
-            bool success = runLowBitAllreduce(std::move(tensors_copy), opts, stream);
+            bool success = runLowBitAllreduce(
+                std::move(tensors_copy),
+                opts,
+                device_index,
+                ready_event);
             lowbitBackendTiming(
                 this,
                 getRank(),
@@ -405,12 +452,25 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
 bool ProcessGroupLowBit::runLowBitAllreduce(
     std::vector<at::Tensor> tensors,
     const c10d::AllreduceOptions& opts,
-    std::optional<c10::cuda::CUDAStream> stream) {
-    c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
+    std::optional<int> device_index,
+    std::shared_ptr<CudaEventHandle> ready_event) {
+    std::optional<c10::cuda::CUDAStream> launcher_stream;
+    if (device_index.has_value()) {
+        launcher_stream = getLauncherStream(*device_index);
+        checkCuda(
+            cudaStreamWaitEvent(launcher_stream->stream(), ready_event->event, 0),
+            "cudaStreamWaitEvent");
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "launcher stream wait_event queued device=" + std::to_string(*device_index));
+    }
+    c10::cuda::OptionalCUDAStreamGuard stream_guard(launcher_stream);
     lowbitBackendTiming(
         this,
         getRank(),
-        "runLowBitAllreduce enter tensors=" + std::to_string(tensors.size()));
+        "runLowBitAllreduce enter tensors=" + std::to_string(tensors.size()) +
+            (device_index.has_value() ? " device=" + std::to_string(*device_index) : ""));
 
     if (tensors.empty()) {
         auto work = nccl_pg_->allreduce(tensors, opts);
@@ -451,9 +511,17 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
         TensorPipelineState s;
         s.original = tensor;
         s.flat = tensor.contiguous().view(-1);
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "local prep flat done tensor_numel=" + std::to_string(s.flat.numel()));
         s.tensor_id = static_cast<int64_t>(
             reinterpret_cast<uintptr_t>(s.original.unsafeGetTensorImpl()));
         auto corrected = s.flat.to(at::kFloat);
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "local prep to_float launched tensor_numel=" + std::to_string(s.flat.numel()));
 
         TORCH_CHECK(
             s.flat.numel() % world_size == 0,
@@ -496,6 +564,10 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
         for (const auto& shard : shards) {
             at::Tensor packed, scale;
             std::tie(packed, scale) = pack(shard);
+            lowbitBackendTiming(
+                this,
+                getRank(),
+                "local pack shard launched shard_numel=" + std::to_string(shard.numel()));
 
             if (stage1_ef) {
                 auto approx = unpack(
@@ -642,7 +714,12 @@ bool ProcessGroupLowBit::runLowBitAllreduce(
         return true;
     };
 
-    return post_hook();
+    bool success = post_hook();
+    if (success && launcher_stream.has_value()) {
+        checkCuda(cudaStreamSynchronize(launcher_stream->stream()), "cudaStreamSynchronize");
+        lowbitBackendTiming(this, getRank(), "launcher stream synchronized");
+    }
+    return success;
 }
 
 void ProcessGroupLowBit::enqueueLowBitTask(std::function<void()> task) {
@@ -673,6 +750,23 @@ void ProcessGroupLowBit::launcherLoop() {
         }
         task();
     }
+}
+
+c10::cuda::CUDAStream ProcessGroupLowBit::getLauncherStream(int device_index) {
+    auto it = launcher_streams_.find(device_index);
+    if (it != launcher_streams_.end()) {
+        return *(it->second);
+    }
+
+    auto stream = c10::cuda::getStreamFromPool(false, device_index);
+    auto inserted = launcher_streams_.emplace(
+        device_index,
+        std::make_unique<c10::cuda::CUDAStream>(stream));
+    lowbitBackendTiming(
+        this,
+        getRank(),
+        "created launcher stream device=" + std::to_string(device_index));
+    return *(inserted.first->second);
 }
 
 // ---- 集合通信原语 ----

@@ -6,6 +6,7 @@
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
 
 #include <condition_variable>
 #include <chrono>
@@ -22,6 +23,8 @@
 #include <vector>
 
 namespace bitscom {
+
+struct CudaEventHandle;
 
 struct LowBitOptions {
     int bitwidth = 4;
@@ -155,9 +158,11 @@ private:
     bool runLowBitAllreduce(
         std::vector<at::Tensor> tensors,
         const c10d::AllreduceOptions& opts,
-        std::optional<c10::cuda::CUDAStream> stream);
+        std::optional<int> device_index,
+        std::shared_ptr<CudaEventHandle> ready_event);
     void enqueueLowBitTask(std::function<void()> task);
     void launcherLoop();
+    c10::cuda::CUDAStream getLauncherStream(int device_index);
 
     bool useStage1ErrorFeedback() const;
     bool useStage2ErrorFeedback() const;
@@ -190,6 +195,8 @@ private:
       std::deque<std::function<void()>> launcher_queue_;
       std::thread launcher_thread_;
       bool launcher_shutdown_ = false;
+      std::unordered_map<int, std::unique_ptr<c10::cuda::CUDAStream>>
+          launcher_streams_;
 };
 
 // 工厂函数，用于 Python 侧 register_backend
