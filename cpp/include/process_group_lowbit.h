@@ -5,11 +5,17 @@
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
+#include <c10/cuda/CUDAStream.h>
 
+#include <condition_variable>
 #include <chrono>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <memory>
+#include <optional>
+#include <thread>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -54,6 +60,27 @@ private:
     bool post_hook_success_ = true;
 };
 
+class WorkBitscom : public c10d::Work {
+public:
+    WorkBitscom();
+
+    bool isCompleted() override;
+    bool isSuccess() const override;
+    bool wait(std::chrono::milliseconds timeout = c10d::kUnsetTimeout) override;
+    c10::intrusive_ptr<c10::ivalue::Future> getFuture() override;
+
+    void markCompleted(bool success = true);
+    void markFailed(std::exception_ptr error);
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool completed_ = false;
+    bool success_ = true;
+    std::exception_ptr error_;
+    c10::intrusive_ptr<c10::ivalue::Future> future_;
+};
+
 // ProcessGroupLowBit: 继承 c10d::Backend
 // 内部持有 ProcessGroupNCCL 做实际通信
 class ProcessGroupLowBit : public c10d::Backend {
@@ -64,7 +91,7 @@ public:
         int size,
         LowBitOptions options = LowBitOptions());
 
-    ~ProcessGroupLowBit() override = default;
+    ~ProcessGroupLowBit() override;
 
     const std::string getBackendName() const override {
         return "lowbit";
@@ -125,6 +152,12 @@ private:
     c10::intrusive_ptr<c10d::Work> allreduceLowBit(
         std::vector<at::Tensor>& tensors,
         const c10d::AllreduceOptions& opts);
+    bool runLowBitAllreduce(
+        std::vector<at::Tensor> tensors,
+        const c10d::AllreduceOptions& opts,
+        std::optional<c10::cuda::CUDAStream> stream);
+    void enqueueLowBitTask(std::function<void()> task);
+    void launcherLoop();
 
     bool useStage1ErrorFeedback() const;
     bool useStage2ErrorFeedback() const;
@@ -151,6 +184,12 @@ private:
       std::unordered_map<int64_t, at::Tensor> residual_cache_;
       std::unordered_map<ResidualShardKey, at::Tensor, ResidualShardKeyHash>
           residual_cache_stage2_;
+
+      std::mutex launcher_mutex_;
+      std::condition_variable launcher_cv_;
+      std::deque<std::function<void()>> launcher_queue_;
+      std::thread launcher_thread_;
+      bool launcher_shutdown_ = false;
 };
 
 // 工厂函数，用于 Python 侧 register_backend

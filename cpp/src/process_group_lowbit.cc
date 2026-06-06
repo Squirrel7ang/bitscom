@@ -2,6 +2,8 @@
 #include "process_group_lowbit.h"
 
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/core/jit_type.h>
 
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #include <algorithm>
@@ -104,6 +106,68 @@ bool WorkLowBit::runPostHook() {
     return post_hook_success_;
 }
 
+// ==================== WorkBitscom ====================
+
+WorkBitscom::WorkBitscom()
+    : c10d::Work(),
+      future_(c10::make_intrusive<c10::ivalue::Future>(c10::BoolType::get())) {}
+
+bool WorkBitscom::isCompleted() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return completed_;
+}
+
+bool WorkBitscom::isSuccess() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return completed_ && success_ && error_ == nullptr;
+}
+
+bool WorkBitscom::wait(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (timeout == c10d::kUnsetTimeout) {
+        cv_.wait(lock, [this]() { return completed_; });
+    } else {
+        if (!cv_.wait_for(lock, timeout, [this]() { return completed_; })) {
+            return false;
+        }
+    }
+    if (error_) {
+        std::rethrow_exception(error_);
+    }
+    return success_;
+}
+
+c10::intrusive_ptr<c10::ivalue::Future> WorkBitscom::getFuture() {
+    return future_;
+}
+
+void WorkBitscom::markCompleted(bool success) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (completed_) {
+            return;
+        }
+        success_ = success;
+        completed_ = true;
+    }
+    future_->markCompleted(c10::IValue(success));
+    cv_.notify_all();
+}
+
+void WorkBitscom::markFailed(std::exception_ptr error) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (completed_) {
+            return;
+        }
+        success_ = false;
+        error_ = std::move(error);
+        completed_ = true;
+    }
+    future_->markCompleted(c10::IValue(false));
+    cv_.notify_all();
+}
+
 // ==================== ProcessGroupLowBit ====================
 
 ProcessGroupLowBit::ProcessGroupLowBit(
@@ -127,6 +191,19 @@ ProcessGroupLowBit::ProcessGroupLowBit(
               << " bitwidth=" << options_.bitwidth
               << " error_feedback=" << errorFeedbackModeName(error_feedback_mode_)
               << std::endl;
+
+    launcher_thread_ = std::thread(&ProcessGroupLowBit::launcherLoop, this);
+}
+
+ProcessGroupLowBit::~ProcessGroupLowBit() {
+    {
+        std::lock_guard<std::mutex> lock(launcher_mutex_);
+        launcher_shutdown_ = true;
+    }
+    launcher_cv_.notify_all();
+    if (launcher_thread_.joinable()) {
+        launcher_thread_.join();
+    }
 }
 
 // ---- pack/unpack 占位实现 ----
@@ -258,9 +335,32 @@ bool ProcessGroupLowBit::useStage2ErrorFeedback() const {
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     std::vector<at::Tensor>& tensors,
     const c10d::AllreduceOptions& opts) {
+    auto work = c10::make_intrusive<WorkBitscom>();
+    std::vector<at::Tensor> tensors_copy = tensors;
+    std::optional<c10::cuda::CUDAStream> stream;
+    if (!tensors.empty() && tensors[0].defined() && tensors[0].is_cuda()) {
+        stream = c10::cuda::getCurrentCUDAStream(tensors[0].device().index());
+    }
+    enqueueLowBitTask([this, tensors_copy = std::move(tensors_copy), opts, stream, work]() mutable {
+        try {
+            bool success = runLowBitAllreduce(std::move(tensors_copy), opts, stream);
+            work->markCompleted(success);
+        } catch (...) {
+            work->markFailed(std::current_exception());
+        }
+    });
+    return work;
+}
+
+bool ProcessGroupLowBit::runLowBitAllreduce(
+    std::vector<at::Tensor> tensors,
+    const c10d::AllreduceOptions& opts,
+    std::optional<c10::cuda::CUDAStream> stream) {
+    c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
 
     if (tensors.empty()) {
-        return nccl_pg_->allreduce(tensors, opts);
+        auto work = nccl_pg_->allreduce(tensors, opts);
+        return work->wait();
     }
 
     struct TensorPipelineState {
@@ -367,7 +467,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
         state->push_back(std::move(s));
     }
 
-    auto anchor = phase1_works[0];
     auto post_hook = [this, state, phase1_works, world_size, rank, stage2_ef]() mutable -> bool {
         for (auto& w : phase1_works) {
             if (!w->wait()) {
@@ -469,7 +568,33 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
         return true;
     };
 
-    return c10::make_intrusive<WorkLowBit>(std::move(anchor), std::move(post_hook));
+    return post_hook();
+}
+
+void ProcessGroupLowBit::enqueueLowBitTask(std::function<void()> task) {
+    {
+        std::lock_guard<std::mutex> lock(launcher_mutex_);
+        launcher_queue_.push_back(std::move(task));
+    }
+    launcher_cv_.notify_one();
+}
+
+void ProcessGroupLowBit::launcherLoop() {
+    while (true) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(launcher_mutex_);
+            launcher_cv_.wait(lock, [this]() {
+                return launcher_shutdown_ || !launcher_queue_.empty();
+            });
+            if (launcher_shutdown_ && launcher_queue_.empty()) {
+                return;
+            }
+            task = std::move(launcher_queue_.front());
+            launcher_queue_.pop_front();
+        }
+        task();
+    }
 }
 
 // ---- 集合通信原语 ----
