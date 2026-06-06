@@ -66,6 +66,7 @@ private:
 class WorkBitscom : public c10d::Work {
 public:
     WorkBitscom();
+    explicit WorkBitscom(std::function<bool()> wait_fn);
 
     bool isCompleted() override;
     bool isSuccess() const override;
@@ -76,12 +77,15 @@ public:
     void markFailed(std::exception_ptr error);
 
 private:
+    bool runWaitFn();
+
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     bool completed_ = false;
     bool success_ = true;
     std::exception_ptr error_;
     c10::intrusive_ptr<c10::ivalue::Future> future_;
+    std::function<bool()> wait_fn_;
 };
 
 // ProcessGroupLowBit: 继承 c10d::Backend
@@ -155,6 +159,11 @@ private:
     c10::intrusive_ptr<c10d::Work> allreduceLowBit(
         std::vector<at::Tensor>& tensors,
         const c10d::AllreduceOptions& opts);
+    c10::intrusive_ptr<c10d::Work> launchLowBitAllreduceOrdered(
+        std::vector<at::Tensor> tensors,
+        const c10d::AllreduceOptions& opts,
+        std::optional<int> device_index,
+        std::shared_ptr<CudaEventHandle> ready_event);
     bool runLowBitAllreduce(
         std::vector<at::Tensor> tensors,
         const c10d::AllreduceOptions& opts,
