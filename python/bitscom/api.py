@@ -572,9 +572,15 @@ class LowBitGroup:
     @staticmethod
     def _block_work_on_current_stream(work) -> None:
         if hasattr(work, "block_current_stream"):
-            work.block_current_stream()
+            with torch.profiler.record_function(
+                "bitscom:_block_work_on_current_stream:block_current_stream"
+            ):
+                work.block_current_stream()
         else:
-            work.wait()
+            with torch.profiler.record_function(
+                "bitscom:_block_work_on_current_stream:fallback_wait"
+            ):
+                work.wait()
 
     def _should_use_pipeline_a(
         self,
@@ -1135,22 +1141,34 @@ class LowBitGroup:
                 send_scales.append(scales)
 
             recv_packed = [torch.empty_like(send_packed[0]) for _ in range(world_size)]
-            packed_work = dist.all_to_all(
-                recv_packed,
-                send_packed,
-                group=group,
-                async_op=True,
-            )
-            self._block_work_on_current_stream(packed_work)
+            with torch.profiler.record_function(
+                "bitscom:_lowbit_stream:launch_all_to_all_packed"
+            ):
+                packed_work = dist.all_to_all(
+                    recv_packed,
+                    send_packed,
+                    group=group,
+                    async_op=True,
+                )
+            with torch.profiler.record_function(
+                "bitscom:_lowbit_stream:block_all_to_all_packed"
+            ):
+                self._block_work_on_current_stream(packed_work)
 
             recv_scales = [torch.empty_like(send_scales[0]) for _ in range(world_size)]
-            scales_work = dist.all_to_all(
-                recv_scales,
-                send_scales,
-                group=group,
-                async_op=True,
-            )
-            self._block_work_on_current_stream(scales_work)
+            with torch.profiler.record_function(
+                "bitscom:_lowbit_stream:launch_all_to_all_scales"
+            ):
+                scales_work = dist.all_to_all(
+                    recv_scales,
+                    send_scales,
+                    group=group,
+                    async_op=True,
+                )
+            with torch.profiler.record_function(
+                "bitscom:_lowbit_stream:block_all_to_all_scales"
+            ):
+                self._block_work_on_current_stream(scales_work)
 
             local_sum = torch.zeros(shard_len, dtype=torch.float32, device=flat.device)
             for src_rank in range(world_size):
@@ -1175,24 +1193,36 @@ class LowBitGroup:
             gathered_packed = [
                 torch.empty_like(packed_reduced) for _ in range(world_size)
             ]
-            gather_packed_work = dist.all_gather(
-                gathered_packed,
-                packed_reduced,
-                group=group,
-                async_op=True,
-            )
-            self._block_work_on_current_stream(gather_packed_work)
+            with torch.profiler.record_function(
+                "bitscom:_lowbit_stream:launch_all_gather_packed"
+            ):
+                gather_packed_work = dist.all_gather(
+                    gathered_packed,
+                    packed_reduced,
+                    group=group,
+                    async_op=True,
+                )
+            with torch.profiler.record_function(
+                "bitscom:_lowbit_stream:block_all_gather_packed"
+            ):
+                self._block_work_on_current_stream(gather_packed_work)
 
             gathered_scales = [
                 torch.empty_like(reduced_scales) for _ in range(world_size)
             ]
-            gather_scales_work = dist.all_gather(
-                gathered_scales,
-                reduced_scales,
-                group=group,
-                async_op=True,
-            )
-            self._block_work_on_current_stream(gather_scales_work)
+            with torch.profiler.record_function(
+                "bitscom:_lowbit_stream:launch_all_gather_scales"
+            ):
+                gather_scales_work = dist.all_gather(
+                    gathered_scales,
+                    reduced_scales,
+                    group=group,
+                    async_op=True,
+                )
+            with torch.profiler.record_function(
+                "bitscom:_lowbit_stream:block_all_gather_scales"
+            ):
+                self._block_work_on_current_stream(gather_scales_work)
 
             out_shards = []
             for rank_idx in range(world_size):
