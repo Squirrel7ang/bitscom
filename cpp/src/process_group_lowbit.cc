@@ -220,7 +220,6 @@ WorkBitscom::WorkBitscom(std::function<bool(bool)> progress_fn)
       progress_fn_(std::move(progress_fn)) {}
 
 bool WorkBitscom::isCompleted() {
-    runProgressFn(false);
     std::lock_guard<std::mutex> lock(mutex_);
     return completed_;
 }
@@ -533,7 +532,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
             (tensors.empty() ? "" : " numel=" + std::to_string(tensors[0].numel())) +
             (device_index.has_value() ? " device=" + std::to_string(*device_index) : ""));
     try {
-        progressLowBitTasks(nullptr, false);
         return launchLowBitAllreduceOrdered(
             std::move(tensors_copy),
             opts,
@@ -750,11 +748,17 @@ bool ProcessGroupLowBit::progressLowBitTasks(
     while (!active_lowbit_tasks_.empty()) {
         auto task = active_lowbit_tasks_.front();
         if (task->phase == LowBitTaskPhase::kPhase1Launched) {
+            if (!lowBitWorksReady(task->phase1_works, block, "phase1")) {
+                break;
+            }
             launchLowBitPhase2(task);
             if (!block) {
                 break;
             }
         } else if (task->phase == LowBitTaskPhase::kPhase2Launched) {
+            if (!lowBitWorksReady(task->phase2_works, block, "phase2")) {
+                break;
+            }
             launchLowBitRestore(task);
             active_lowbit_tasks_.pop_front();
             if (target && task == target) {
@@ -794,6 +798,29 @@ bool ProcessGroupLowBit::progressLowBitTasks(
     return false;
 }
 
+bool ProcessGroupLowBit::progressLowBit(bool block) {
+    return progressLowBitTasks(nullptr, block);
+}
+
+bool ProcessGroupLowBit::lowBitWorksReady(
+    const std::vector<c10::intrusive_ptr<c10d::Work>>& works,
+    bool block,
+    const char* label) {
+    for (auto& w : works) {
+        if (block) {
+            if (!w->wait()) {
+                lowbitBackendTiming(this, getRank(), std::string("state ") + label + " wait failed");
+                return false;
+            }
+        } else if (!w->isCompleted()) {
+            lowbitBackendTiming(this, getRank(), std::string("state ") + label + " not ready");
+            return false;
+        }
+    }
+    lowbitBackendTiming(this, getRank(), std::string("state ") + label + (block ? " wait done" : " ready"));
+    return true;
+}
+
 void ProcessGroupLowBit::launchLowBitPhase2(
     const std::shared_ptr<LowBitAllreduceTask>& task) {
     std::optional<c10::cuda::CUDAStream> stream;
@@ -804,10 +831,6 @@ void ProcessGroupLowBit::launchLowBitPhase2(
     c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
 
     lowbitBackendTiming(this, getRank(), "state phase2 launch enter works=" + std::to_string(task->phase1_works.size()));
-    for (auto& w : task->phase1_works) {
-        w->synchronize();
-    }
-    lowbitBackendTiming(this, getRank(), "state phase1 synchronize done");
 
     c10d::AllgatherOptions allgather_opts;
     for (auto& s : task->tensors) {
@@ -896,10 +919,6 @@ void ProcessGroupLowBit::launchLowBitRestore(
     c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
 
     lowbitBackendTiming(this, getRank(), "state restore launch enter works=" + std::to_string(task->phase2_works.size()));
-    for (auto& w : task->phase2_works) {
-        w->synchronize();
-    }
-    lowbitBackendTiming(this, getRank(), "state phase2 synchronize done");
 
     for (auto& s : task->tensors) {
         std::vector<at::Tensor> out_shards;

@@ -360,6 +360,12 @@ class LowBitGroup:
         self.block_size = int(block_size)
         self.backend_allreduce = bool(backend_allreduce)
 
+    def progress_lowbit(self, block: bool = False) -> bool:
+        progress = getattr(self.pg, "progress_lowbit", None)
+        if progress is None:
+            return False
+        return bool(progress(bool(block)))
+
     def _comm_debug_enabled(self) -> bool:
         return os.environ.get("BITSCOM_COMM_DEBUG", "0").lower() in {
             "1",

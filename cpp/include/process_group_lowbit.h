@@ -141,6 +141,8 @@ public:
         std::vector<int64_t>& input_split_sizes,
         const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
 
+    bool progressLowBit(bool block = false);
+
 private:
     // 底层 NCCL process group
     c10::intrusive_ptr<c10d::ProcessGroupNCCL> nccl_pg_;
@@ -172,6 +174,10 @@ private:
     bool progressLowBitTasks(
         const std::shared_ptr<LowBitAllreduceTask>& target,
         bool block);
+    bool lowBitWorksReady(
+        const std::vector<c10::intrusive_ptr<c10d::Work>>& works,
+        bool block,
+        const char* label);
     void launchLowBitPhase2(const std::shared_ptr<LowBitAllreduceTask>& task);
     void launchLowBitRestore(const std::shared_ptr<LowBitAllreduceTask>& task);
     bool runLowBitAllreduce(

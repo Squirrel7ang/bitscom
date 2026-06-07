@@ -66,7 +66,11 @@ PYBIND11_MODULE(_lowbit_c, m) {
             py::arg("store"),
             py::arg("rank"),
             py::arg("size"),
-            py::arg("options") = bitscom::LowBitOptions());
+            py::arg("options") = bitscom::LowBitOptions())
+        .def(
+            "progress_lowbit",
+            &bitscom::ProcessGroupLowBit::progressLowBit,
+            py::arg("block") = false);
 
     // 暴露工厂函数
     m.def("create_backend", &createBackend,
