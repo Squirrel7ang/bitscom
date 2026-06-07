@@ -248,6 +248,7 @@ WorkBitscom::WorkBitscom(std::function<bool(bool)> progress_fn)
       progress_fn_(std::move(progress_fn)) {}
 
 bool WorkBitscom::isCompleted() {
+    runProgressFn(false);
     std::lock_guard<std::mutex> lock(mutex_);
     return completed_;
 }
