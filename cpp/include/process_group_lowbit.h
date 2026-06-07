@@ -25,6 +25,7 @@
 namespace bitscom {
 
 struct CudaEventHandle;
+struct LowBitAllreduceTask;
 
 struct LowBitOptions {
     int bitwidth = 4;
@@ -67,6 +68,7 @@ class WorkBitscom : public c10d::Work {
 public:
     WorkBitscom();
     explicit WorkBitscom(std::function<bool()> wait_fn);
+    explicit WorkBitscom(std::function<bool(bool)> progress_fn);
 
     bool isCompleted() override;
     bool isSuccess() const override;
@@ -78,6 +80,7 @@ public:
 
 private:
     bool runWaitFn();
+    bool runProgressFn(bool block);
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -86,6 +89,8 @@ private:
     std::exception_ptr error_;
     c10::intrusive_ptr<c10::ivalue::Future> future_;
     std::function<bool()> wait_fn_;
+    std::function<bool(bool)> progress_fn_;
+    std::mutex progress_mutex_;
 };
 
 // ProcessGroupLowBit: 继承 c10d::Backend
@@ -164,6 +169,11 @@ private:
         const c10d::AllreduceOptions& opts,
         std::optional<int> device_index,
         std::shared_ptr<CudaEventHandle> ready_event);
+    bool progressLowBitTasks(
+        const std::shared_ptr<LowBitAllreduceTask>& target,
+        bool block);
+    void launchLowBitPhase2(const std::shared_ptr<LowBitAllreduceTask>& task);
+    void launchLowBitRestore(const std::shared_ptr<LowBitAllreduceTask>& task);
     bool runLowBitAllreduce(
         std::vector<at::Tensor> tensors,
         const c10d::AllreduceOptions& opts,
@@ -206,6 +216,8 @@ private:
       bool launcher_shutdown_ = false;
       std::unordered_map<int, std::unique_ptr<c10::cuda::CUDAStream>>
           launcher_streams_;
+      std::mutex lowbit_progress_mutex_;
+      std::deque<std::shared_ptr<LowBitAllreduceTask>> active_lowbit_tasks_;
 };
 
 // 工厂函数，用于 Python 侧 register_backend

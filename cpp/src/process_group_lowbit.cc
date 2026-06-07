@@ -121,6 +121,42 @@ struct CudaEventHandle {
     CudaEventHandle& operator=(const CudaEventHandle&) = delete;
 };
 
+enum class LowBitTaskPhase {
+    kPhase1Launched = 0,
+    kPhase2Launched = 1,
+    kRestoreLaunched = 2,
+    kDone = 3,
+};
+
+struct TensorPipelineState {
+    at::Tensor original;
+    at::Tensor flat;
+    int64_t tensor_id = 0;
+    int64_t shard_len = 0;
+
+    std::vector<at::Tensor> send_packed;
+    std::vector<at::Tensor> recv_packed;
+    std::vector<at::Tensor> send_scales;
+    std::vector<at::Tensor> recv_scales;
+
+    at::Tensor reduced_packed;
+    at::Tensor reduced_scale;
+    std::vector<std::vector<at::Tensor>> gathered_packed;
+    std::vector<std::vector<at::Tensor>> gathered_scales;
+};
+
+struct LowBitAllreduceTask {
+    std::vector<TensorPipelineState> tensors;
+    std::vector<c10::intrusive_ptr<c10d::Work>> phase1_works;
+    std::vector<c10::intrusive_ptr<c10d::Work>> phase2_works;
+    std::optional<int> device_index;
+    std::shared_ptr<CudaEventHandle> done_event;
+    int world_size = 0;
+    int rank = 0;
+    bool stage2_ef = false;
+    LowBitTaskPhase phase = LowBitTaskPhase::kPhase1Launched;
+};
+
 // ==================== WorkLowBit ====================
 
 WorkLowBit::WorkLowBit(
@@ -178,7 +214,13 @@ WorkBitscom::WorkBitscom(std::function<bool()> wait_fn)
       future_(c10::make_intrusive<c10::ivalue::Future>(c10::BoolType::get())),
       wait_fn_(std::move(wait_fn)) {}
 
+WorkBitscom::WorkBitscom(std::function<bool(bool)> progress_fn)
+    : c10d::Work(),
+      future_(c10::make_intrusive<c10::ivalue::Future>(c10::BoolType::get())),
+      progress_fn_(std::move(progress_fn)) {}
+
 bool WorkBitscom::isCompleted() {
+    runProgressFn(false);
     std::lock_guard<std::mutex> lock(mutex_);
     return completed_;
 }
@@ -189,6 +231,9 @@ bool WorkBitscom::isSuccess() const {
 }
 
 bool WorkBitscom::wait(std::chrono::milliseconds timeout) {
+    if (!runProgressFn(true)) {
+        return false;
+    }
     if (!runWaitFn()) {
         return false;
     }
@@ -256,6 +301,33 @@ bool WorkBitscom::runWaitFn() {
         bool success = wait_fn();
         markCompleted(success);
         return success;
+    } catch (...) {
+        markFailed(std::current_exception());
+        std::rethrow_exception(std::current_exception());
+    }
+}
+
+bool WorkBitscom::runProgressFn(bool block) {
+    std::function<bool(bool)> progress_fn;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (completed_) {
+            return success_;
+        }
+        progress_fn = progress_fn_;
+    }
+
+    if (!progress_fn) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> progress_lock(progress_mutex_);
+    try {
+        bool completed = progress_fn(block);
+        if (completed) {
+            markCompleted(true);
+        }
+        return true;
     } catch (...) {
         markFailed(std::current_exception());
         std::rethrow_exception(std::current_exception());
@@ -461,6 +533,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
             (tensors.empty() ? "" : " numel=" + std::to_string(tensors[0].numel())) +
             (device_index.has_value() ? " device=" + std::to_string(*device_index) : ""));
     try {
+        progressLowBitTasks(nullptr, false);
         return launchLowBitAllreduceOrdered(
             std::move(tensors_copy),
             opts,
@@ -510,29 +583,20 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
         return nccl_pg_->allreduce(tensors, opts);
     }
 
-    struct TensorPipelineState {
-        at::Tensor original;
-        at::Tensor flat;
-        int64_t tensor_id = 0;
-        int64_t shard_len = 0;
-
-        std::vector<at::Tensor> send_packed;
-        std::vector<at::Tensor> recv_packed;
-        std::vector<at::Tensor> send_scales;
-        std::vector<at::Tensor> recv_scales;
-    };
-
-    auto state = std::make_shared<std::vector<TensorPipelineState>>();
-    state->reserve(tensors.size());
+    auto task = std::make_shared<LowBitAllreduceTask>();
+    task->tensors.reserve(tensors.size());
 
     const int world_size = getSize();
     const int rank = getRank();
+    task->world_size = world_size;
+    task->rank = rank;
+    task->device_index = device_index;
 
     const bool stage1_ef = useStage1ErrorFeedback();
     const bool stage2_ef = useStage2ErrorFeedback();
+    task->stage2_ef = stage2_ef;
 
     c10d::AllToAllOptions alltoall_opts;
-    std::vector<c10::intrusive_ptr<c10d::Work>> phase1_works;
 
     for (auto& tensor : tensors) {
         TensorPipelineState s;
@@ -624,7 +688,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
             this,
             getRank(),
             "ordered phase1 packed alltoall enter tensor_numel=" + std::to_string(s.flat.numel()));
-        phase1_works.push_back(nccl_pg_->alltoall(s.recv_packed, s.send_packed, alltoall_opts));
+        task->phase1_works.push_back(nccl_pg_->alltoall(s.recv_packed, s.send_packed, alltoall_opts));
         lowbitBackendTiming(
             this,
             getRank(),
@@ -633,7 +697,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
             this,
             getRank(),
             "ordered phase1 scales alltoall enter tensor_numel=" + std::to_string(s.flat.numel()));
-        phase1_works.push_back(nccl_pg_->alltoall(s.recv_scales, s.send_scales, alltoall_opts));
+        task->phase1_works.push_back(nccl_pg_->alltoall(s.recv_scales, s.send_scales, alltoall_opts));
         lowbitBackendTiming(
             this,
             getRank(),
@@ -643,132 +707,224 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
             getRank(),
             "ordered phase1 alltoall launched tensor_numel=" + std::to_string(s.flat.numel()));
 
-        state->push_back(std::move(s));
+        task->tensors.push_back(std::move(s));
     }
 
-    auto wait_fn = [this, state, phase1_works, world_size, rank, stage2_ef, device_index]() mutable -> bool {
-        std::optional<c10::cuda::CUDAStream> stream;
-        if (device_index.has_value()) {
-            c10::cuda::CUDAGuard device_guard(*device_index);
-            stream = getLauncherStream(*device_index);
+    {
+        std::lock_guard<std::mutex> lock(lowbit_progress_mutex_);
+        active_lowbit_tasks_.push_back(task);
+    }
+
+    auto progress_fn = [this, task](bool block) mutable -> bool {
+        return progressLowBitTasks(task, block);
+    };
+    return c10::make_intrusive<WorkBitscom>(std::move(progress_fn));
+}
+
+bool ProcessGroupLowBit::progressLowBitTasks(
+    const std::shared_ptr<LowBitAllreduceTask>& target,
+    bool block) {
+    std::lock_guard<std::mutex> lock(lowbit_progress_mutex_);
+
+    auto finishRestoreIfReady = [this, block](const std::shared_ptr<LowBitAllreduceTask>& task) -> bool {
+        if (task->phase != LowBitTaskPhase::kRestoreLaunched) {
+            return false;
         }
-        c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
-
-        lowbitBackendTiming(this, getRank(), "ordered phase1 wait enter works=" + std::to_string(phase1_works.size()));
-        for (auto& w : phase1_works) {
-            if (!w->wait()) {
-                lowbitBackendTiming(this, getRank(), "ordered phase1 wait failed");
-                return false;
-            }
-        }
-        lowbitBackendTiming(this, getRank(), "ordered phase1 wait done");
-
-        c10d::AllgatherOptions allgather_opts;
-        for (auto& s : *state) {
-            auto local_sum = at::zeros({s.shard_len}, s.flat.options().dtype(at::kFloat));
-
-            for (int src = 0; src < world_size; ++src) {
-                auto fp = unpack(
-                    s.recv_packed[src],
-                    s.shard_len,
-                    s.recv_scales[src],
-                    s.flat.device(),
-                    at::kFloat);
-                local_sum.add_(fp);
-            }
-
-            at::Tensor reduce_input = local_sum;
-            if (stage2_ef) {
-                ResidualShardKey key{s.tensor_id, static_cast<int64_t>(rank)};
-                at::Tensor residual;
-                {
-                    std::lock_guard<std::mutex> lock(residual_mutex_);
-                    auto it = residual_cache_stage2_.find(key);
-                    if (it != residual_cache_stage2_.end()) {
-                        residual = it->second;
-                    }
+        if (task->done_event) {
+            c10::cuda::CUDAGuard device_guard(task->done_event->device_index);
+            if (block) {
+                checkCuda(cudaEventSynchronize(task->done_event->event), "cudaEventSynchronize");
+            } else {
+                auto status = cudaEventQuery(task->done_event->event);
+                if (status == cudaErrorNotReady) {
+                    return false;
                 }
-
-                if (!residual.defined() ||
-                    residual.numel() != local_sum.numel() ||
-                    residual.device() != local_sum.device() ||
-                    residual.scalar_type() != at::kFloat) {
-                    residual = at::zeros_like(local_sum);
-                }
-                reduce_input = local_sum + residual;
+                checkCuda(status, "cudaEventQuery");
             }
-
-            at::Tensor reduced_packed, reduced_scale;
-            std::tie(reduced_packed, reduced_scale) = pack(reduce_input);
-
-            if (stage2_ef) {
-                auto approx = unpack(
-                    reduced_packed,
-                    s.shard_len,
-                    reduced_scale,
-                    s.flat.device(),
-                    at::kFloat);
-                auto new_residual = (reduce_input - approx).contiguous();
-                ResidualShardKey key{s.tensor_id, static_cast<int64_t>(rank)};
-                std::lock_guard<std::mutex> lock(residual_mutex_);
-                residual_cache_stage2_[key] = new_residual;
-            }
-
-            std::vector<std::vector<at::Tensor>> gathered_packed(1);
-            gathered_packed[0].reserve(world_size);
-            for (int i = 0; i < world_size; ++i) {
-                gathered_packed[0].push_back(at::empty_like(reduced_packed));
-            }
-
-            std::vector<at::Tensor> packed_input = {reduced_packed};
-            auto wg_packed = nccl_pg_->allgather(gathered_packed, packed_input, allgather_opts);
-            lowbitBackendTiming(this, getRank(), "ordered allgather packed launched");
-            if (!wg_packed->wait()) {
-                lowbitBackendTiming(this, getRank(), "ordered allgather packed wait failed");
-                return false;
-            }
-            lowbitBackendTiming(this, getRank(), "ordered allgather packed wait done");
-
-            std::vector<std::vector<at::Tensor>> gathered_scales(1);
-            gathered_scales[0].reserve(world_size);
-            for (int i = 0; i < world_size; ++i) {
-                gathered_scales[0].push_back(at::empty_like(reduced_scale));
-            }
-
-            std::vector<at::Tensor> scale_input = {reduced_scale};
-            auto wg_scale = nccl_pg_->allgather(gathered_scales, scale_input, allgather_opts);
-            lowbitBackendTiming(this, getRank(), "ordered allgather scales launched");
-            if (!wg_scale->wait()) {
-                lowbitBackendTiming(this, getRank(), "ordered allgather scales wait failed");
-                return false;
-            }
-            lowbitBackendTiming(this, getRank(), "ordered allgather scales wait done");
-
-            std::vector<at::Tensor> out_shards;
-            out_shards.reserve(world_size);
-            for (int r = 0; r < world_size; ++r) {
-                auto fp_shard = unpack(
-                    gathered_packed[0][r],
-                    s.shard_len,
-                    gathered_scales[0][r],
-                    s.flat.device(),
-                    at::kFloat);
-                out_shards.push_back(fp_shard);
-            }
-
-            auto restored = at::cat(out_shards, 0).view_as(s.original).to(s.original.scalar_type());
-            s.original.copy_(restored);
-            lowbitBackendTiming(this, getRank(), "ordered restore done tensor_numel=" + std::to_string(s.flat.numel()));
         }
-
-        if (stream.has_value()) {
-            checkCuda(cudaStreamSynchronize(stream->stream()), "cudaStreamSynchronize");
-            lowbitBackendTiming(this, getRank(), "ordered launcher stream synchronized");
-        }
+        task->phase = LowBitTaskPhase::kDone;
+        lowbitBackendTiming(this, getRank(), "state progress task done");
         return true;
     };
 
-    return c10::make_intrusive<WorkBitscom>(std::move(wait_fn));
+    while (!active_lowbit_tasks_.empty()) {
+        auto task = active_lowbit_tasks_.front();
+        if (task->phase == LowBitTaskPhase::kPhase1Launched) {
+            launchLowBitPhase2(task);
+            if (!block) {
+                break;
+            }
+        } else if (task->phase == LowBitTaskPhase::kPhase2Launched) {
+            launchLowBitRestore(task);
+            active_lowbit_tasks_.pop_front();
+            if (target && task == target) {
+                if (block) {
+                    return finishRestoreIfReady(task);
+                }
+                break;
+            }
+            if (!block) {
+                break;
+            }
+        } else if (task->phase == LowBitTaskPhase::kRestoreLaunched) {
+            if (!finishRestoreIfReady(task)) {
+                break;
+            }
+            active_lowbit_tasks_.pop_front();
+            if (target && task == target) {
+                return true;
+            }
+        } else {
+            active_lowbit_tasks_.pop_front();
+            if (target && task == target) {
+                return true;
+            }
+        }
+    }
+
+    if (!target) {
+        return false;
+    }
+    if (target->phase == LowBitTaskPhase::kDone) {
+        return true;
+    }
+    if (target->phase == LowBitTaskPhase::kRestoreLaunched) {
+        return finishRestoreIfReady(target);
+    }
+    return false;
+}
+
+void ProcessGroupLowBit::launchLowBitPhase2(
+    const std::shared_ptr<LowBitAllreduceTask>& task) {
+    std::optional<c10::cuda::CUDAStream> stream;
+    if (task->device_index.has_value()) {
+        c10::cuda::CUDAGuard device_guard(*task->device_index);
+        stream = getLauncherStream(*task->device_index);
+    }
+    c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
+
+    lowbitBackendTiming(this, getRank(), "state phase2 launch enter works=" + std::to_string(task->phase1_works.size()));
+    for (auto& w : task->phase1_works) {
+        w->blockCurrentStream();
+    }
+    lowbitBackendTiming(this, getRank(), "state phase1 blockCurrentStream done");
+
+    c10d::AllgatherOptions allgather_opts;
+    for (auto& s : task->tensors) {
+        auto local_sum = at::zeros({s.shard_len}, s.flat.options().dtype(at::kFloat));
+
+        for (int src = 0; src < task->world_size; ++src) {
+            auto fp = unpack(
+                s.recv_packed[src],
+                s.shard_len,
+                s.recv_scales[src],
+                s.flat.device(),
+                at::kFloat);
+            local_sum.add_(fp);
+        }
+
+        at::Tensor reduce_input = local_sum;
+        if (task->stage2_ef) {
+            ResidualShardKey key{s.tensor_id, static_cast<int64_t>(task->rank)};
+            at::Tensor residual;
+            {
+                std::lock_guard<std::mutex> lock(residual_mutex_);
+                auto it = residual_cache_stage2_.find(key);
+                if (it != residual_cache_stage2_.end()) {
+                    residual = it->second;
+                }
+            }
+
+            if (!residual.defined() ||
+                residual.numel() != local_sum.numel() ||
+                residual.device() != local_sum.device() ||
+                residual.scalar_type() != at::kFloat) {
+                residual = at::zeros_like(local_sum);
+            }
+            reduce_input = local_sum + residual;
+        }
+
+        std::tie(s.reduced_packed, s.reduced_scale) = pack(reduce_input);
+
+        if (task->stage2_ef) {
+            auto approx = unpack(
+                s.reduced_packed,
+                s.shard_len,
+                s.reduced_scale,
+                s.flat.device(),
+                at::kFloat);
+            auto new_residual = (reduce_input - approx).contiguous();
+            ResidualShardKey key{s.tensor_id, static_cast<int64_t>(task->rank)};
+            std::lock_guard<std::mutex> lock(residual_mutex_);
+            residual_cache_stage2_[key] = new_residual;
+        }
+
+        s.gathered_packed = std::vector<std::vector<at::Tensor>>(1);
+        s.gathered_packed[0].reserve(task->world_size);
+        for (int i = 0; i < task->world_size; ++i) {
+            s.gathered_packed[0].push_back(at::empty_like(s.reduced_packed));
+        }
+
+        std::vector<at::Tensor> packed_input = {s.reduced_packed};
+        task->phase2_works.push_back(
+            nccl_pg_->allgather(s.gathered_packed, packed_input, allgather_opts));
+        lowbitBackendTiming(this, getRank(), "state allgather packed launched");
+
+        s.gathered_scales = std::vector<std::vector<at::Tensor>>(1);
+        s.gathered_scales[0].reserve(task->world_size);
+        for (int i = 0; i < task->world_size; ++i) {
+            s.gathered_scales[0].push_back(at::empty_like(s.reduced_scale));
+        }
+
+        std::vector<at::Tensor> scale_input = {s.reduced_scale};
+        task->phase2_works.push_back(
+            nccl_pg_->allgather(s.gathered_scales, scale_input, allgather_opts));
+        lowbitBackendTiming(this, getRank(), "state allgather scales launched");
+    }
+
+    task->phase = LowBitTaskPhase::kPhase2Launched;
+    lowbitBackendTiming(this, getRank(), "state phase2 launch exit works=" + std::to_string(task->phase2_works.size()));
+}
+
+void ProcessGroupLowBit::launchLowBitRestore(
+    const std::shared_ptr<LowBitAllreduceTask>& task) {
+    std::optional<c10::cuda::CUDAStream> stream;
+    if (task->device_index.has_value()) {
+        c10::cuda::CUDAGuard device_guard(*task->device_index);
+        stream = getLauncherStream(*task->device_index);
+    }
+    c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
+
+    lowbitBackendTiming(this, getRank(), "state restore launch enter works=" + std::to_string(task->phase2_works.size()));
+    for (auto& w : task->phase2_works) {
+        w->blockCurrentStream();
+    }
+    lowbitBackendTiming(this, getRank(), "state phase2 blockCurrentStream done");
+
+    for (auto& s : task->tensors) {
+        std::vector<at::Tensor> out_shards;
+        out_shards.reserve(task->world_size);
+        for (int r = 0; r < task->world_size; ++r) {
+            auto fp_shard = unpack(
+                s.gathered_packed[0][r],
+                s.shard_len,
+                s.gathered_scales[0][r],
+                s.flat.device(),
+                at::kFloat);
+            out_shards.push_back(fp_shard);
+        }
+
+        auto restored = at::cat(out_shards, 0).view_as(s.original).to(s.original.scalar_type());
+        s.original.copy_(restored);
+        lowbitBackendTiming(this, getRank(), "state restore launched tensor_numel=" + std::to_string(s.flat.numel()));
+    }
+
+    if (stream.has_value() && task->device_index.has_value()) {
+        task->done_event = std::make_shared<CudaEventHandle>(*task->device_index);
+        checkCuda(cudaEventRecord(task->done_event->event, stream->stream()), "cudaEventRecord");
+    }
+    task->phase = LowBitTaskPhase::kRestoreLaunched;
+    lowbitBackendTiming(this, getRank(), "state restore launch exit");
 }
 
 bool ProcessGroupLowBit::runLowBitAllreduce(
