@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -97,6 +98,31 @@ void checkCuda(cudaError_t err, const char* what) {
         cudaGetErrorString(err));
 }
 
+void checkNccl(ncclResult_t result, const char* what) {
+    TORCH_CHECK(
+        result == ncclSuccess,
+        what,
+        " failed: ",
+        ncclGetErrorString(result));
+}
+
+ncclDataType_t ncclDataTypeFor(const at::Tensor& tensor) {
+    switch (tensor.scalar_type()) {
+        case at::kByte:
+            return ncclUint8;
+        case at::kChar:
+            return ncclInt8;
+        case at::kHalf:
+            return ncclFloat16;
+        case at::kFloat:
+            return ncclFloat32;
+        case at::kBFloat16:
+            return ncclBfloat16;
+        default:
+            TORCH_CHECK(false, "unsupported bitscom NCCL dtype: ", tensor.scalar_type());
+    }
+}
+
 }  // namespace
 
 struct CudaEventHandle {
@@ -150,6 +176,8 @@ struct LowBitAllreduceTask {
     std::vector<c10::intrusive_ptr<c10d::Work>> phase1_works;
     std::vector<c10::intrusive_ptr<c10d::Work>> phase2_works;
     std::optional<int> device_index;
+    std::shared_ptr<CudaEventHandle> phase1_done_event;
+    std::shared_ptr<CudaEventHandle> phase2_done_event;
     std::shared_ptr<CudaEventHandle> done_event;
     int world_size = 0;
     int rank = 0;
@@ -340,7 +368,7 @@ ProcessGroupLowBit::ProcessGroupLowBit(
     int rank,
     int size,
     LowBitOptions options)
-    : c10d::Backend(rank, size), options_(std::move(options)) {
+    : c10d::Backend(rank, size), store_(store), options_(std::move(options)) {
 
     // 创建底层 NCCL ProcessGroup
     auto nccl_options = c10d::ProcessGroupNCCL::Options::create();
@@ -362,6 +390,7 @@ ProcessGroupLowBit::ProcessGroupLowBit(
         "ProcessGroupLowBit created size=" + std::to_string(size) +
             " bitwidth=" + std::to_string(options_.bitwidth) +
             " error_feedback=" + errorFeedbackModeName(error_feedback_mode_));
+    initLowBitComm();
 
     // NCCL collectives are launched from the caller's host thread to preserve
     // cross-communicator launch ordering with the training runtime.
@@ -369,6 +398,10 @@ ProcessGroupLowBit::ProcessGroupLowBit(
 
 ProcessGroupLowBit::~ProcessGroupLowBit() {
     lowbitBackendTiming(this, getRank(), "ProcessGroupLowBit destructor enter");
+    if (lowbit_comm_ != nullptr) {
+        ncclCommDestroy(lowbit_comm_);
+        lowbit_comm_ = nullptr;
+    }
     {
         std::lock_guard<std::mutex> lock(launcher_mutex_);
         launcher_shutdown_ = true;
@@ -506,6 +539,40 @@ bool ProcessGroupLowBit::useStage2ErrorFeedback() const {
         error_feedback_mode_ == ErrorFeedbackMode::kEF21Plus;
 }
 
+void ProcessGroupLowBit::initLowBitComm() {
+    ncclUniqueId id;
+    const std::string key = "bitscom_lowbit_nccl_unique_id";
+    if (getRank() == 0) {
+        checkNccl(ncclGetUniqueId(&id), "ncclGetUniqueId");
+        std::vector<uint8_t> bytes(
+            reinterpret_cast<uint8_t*>(&id),
+            reinterpret_cast<uint8_t*>(&id) + sizeof(ncclUniqueId));
+        store_->set(key, bytes);
+        lowbitBackendTiming(this, getRank(), "lowbit nccl unique id stored");
+    } else {
+        auto bytes = store_->get(key);
+        TORCH_CHECK(
+            bytes.size() == sizeof(ncclUniqueId),
+            "invalid lowbit nccl unique id size: ",
+            bytes.size());
+        std::memcpy(&id, bytes.data(), sizeof(ncclUniqueId));
+        lowbitBackendTiming(this, getRank(), "lowbit nccl unique id loaded");
+    }
+
+    int device_index = 0;
+    if (at::cuda::is_available()) {
+        device_index = c10::cuda::current_device();
+    }
+    c10::cuda::CUDAGuard device_guard(device_index);
+    checkNccl(
+        ncclCommInitRank(&lowbit_comm_, getSize(), id, getRank()),
+        "ncclCommInitRank");
+    lowbitBackendTiming(
+        this,
+        getRank(),
+        "lowbit nccl comm initialized device=" + std::to_string(device_index));
+}
+
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     std::vector<at::Tensor>& tensors,
     const c10d::AllreduceOptions& opts) {
@@ -561,7 +628,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
     std::optional<c10::cuda::CUDAStream> launcher_stream;
     if (device_index.has_value()) {
         c10::cuda::CUDAGuard device_guard(*device_index);
-        launcher_stream = getLauncherStream(*device_index);
+        launcher_stream = getLowBitStream(*device_index, 0);
         checkCuda(
             cudaStreamWaitEvent(launcher_stream->stream(), ready_event->event, 0),
             "cudaStreamWaitEvent");
@@ -686,7 +753,32 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
             this,
             getRank(),
             "ordered phase1 packed alltoall enter tensor_numel=" + std::to_string(s.flat.numel()));
-        task->phase1_works.push_back(nccl_pg_->alltoall(s.recv_packed, s.send_packed, alltoall_opts));
+        checkNccl(ncclGroupStart(), "ncclGroupStart phase1 packed");
+        for (int peer = 0; peer < world_size; ++peer) {
+            if (peer == rank) {
+                continue;
+            }
+            checkNccl(
+                ncclRecv(
+                    s.recv_packed[peer].data_ptr(),
+                    s.recv_packed[peer].numel(),
+                    ncclDataTypeFor(s.recv_packed[peer]),
+                    peer,
+                    lowbit_comm_,
+                    launcher_stream->stream()),
+                "ncclRecv phase1 packed");
+            checkNccl(
+                ncclSend(
+                    s.send_packed[peer].data_ptr(),
+                    s.send_packed[peer].numel(),
+                    ncclDataTypeFor(s.send_packed[peer]),
+                    peer,
+                    lowbit_comm_,
+                    launcher_stream->stream()),
+                "ncclSend phase1 packed");
+        }
+        checkNccl(ncclGroupEnd(), "ncclGroupEnd phase1 packed");
+        s.recv_packed[rank].copy_(s.send_packed[rank]);
         lowbitBackendTiming(
             this,
             getRank(),
@@ -695,7 +787,32 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
             this,
             getRank(),
             "ordered phase1 scales alltoall enter tensor_numel=" + std::to_string(s.flat.numel()));
-        task->phase1_works.push_back(nccl_pg_->alltoall(s.recv_scales, s.send_scales, alltoall_opts));
+        checkNccl(ncclGroupStart(), "ncclGroupStart phase1 scales");
+        for (int peer = 0; peer < world_size; ++peer) {
+            if (peer == rank) {
+                continue;
+            }
+            checkNccl(
+                ncclRecv(
+                    s.recv_scales[peer].data_ptr(),
+                    s.recv_scales[peer].numel(),
+                    ncclDataTypeFor(s.recv_scales[peer]),
+                    peer,
+                    lowbit_comm_,
+                    launcher_stream->stream()),
+                "ncclRecv phase1 scales");
+            checkNccl(
+                ncclSend(
+                    s.send_scales[peer].data_ptr(),
+                    s.send_scales[peer].numel(),
+                    ncclDataTypeFor(s.send_scales[peer]),
+                    peer,
+                    lowbit_comm_,
+                    launcher_stream->stream()),
+                "ncclSend phase1 scales");
+        }
+        checkNccl(ncclGroupEnd(), "ncclGroupEnd phase1 scales");
+        s.recv_scales[rank].copy_(s.send_scales[rank]);
         lowbitBackendTiming(
             this,
             getRank(),
@@ -706,6 +823,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
             "ordered phase1 alltoall launched tensor_numel=" + std::to_string(s.flat.numel()));
 
         task->tensors.push_back(std::move(s));
+    }
+
+    if (device_index.has_value()) {
+        task->phase1_done_event = std::make_shared<CudaEventHandle>(*device_index);
+        checkCuda(
+            cudaEventRecord(task->phase1_done_event->event, launcher_stream->stream()),
+            "cudaEventRecord phase1");
+        lowbitBackendTiming(this, getRank(), "state phase1 done event recorded");
     }
 
     {
@@ -723,6 +848,24 @@ bool ProcessGroupLowBit::progressLowBitTasks(
     const std::shared_ptr<LowBitAllreduceTask>& target,
     bool block) {
     std::lock_guard<std::mutex> lock(lowbit_progress_mutex_);
+    bool progressed = false;
+
+    auto eventReady = [block](const std::shared_ptr<CudaEventHandle>& event) -> bool {
+        if (!event) {
+            return true;
+        }
+        c10::cuda::CUDAGuard device_guard(event->device_index);
+        if (block) {
+            checkCuda(cudaEventSynchronize(event->event), "cudaEventSynchronize");
+            return true;
+        }
+        auto status = cudaEventQuery(event->event);
+        if (status == cudaErrorNotReady) {
+            return false;
+        }
+        checkCuda(status, "cudaEventQuery");
+        return true;
+    };
 
     auto finishRestoreIfReady = [this, block](const std::shared_ptr<LowBitAllreduceTask>& task) -> bool {
         if (task->phase != LowBitTaskPhase::kRestoreLaunched) {
@@ -748,18 +891,24 @@ bool ProcessGroupLowBit::progressLowBitTasks(
     while (!active_lowbit_tasks_.empty()) {
         auto task = active_lowbit_tasks_.front();
         if (task->phase == LowBitTaskPhase::kPhase1Launched) {
-            if (!lowBitWorksReady(task->phase1_works, block, "phase1")) {
+            if (!eventReady(task->phase1_done_event)) {
+                lowbitBackendTiming(this, getRank(), "state phase1 event not ready");
                 break;
             }
+            lowbitBackendTiming(this, getRank(), std::string("state phase1 event ") + (block ? "wait done" : "ready"));
             launchLowBitPhase2(task);
+            progressed = true;
             if (!block) {
                 break;
             }
         } else if (task->phase == LowBitTaskPhase::kPhase2Launched) {
-            if (!lowBitWorksReady(task->phase2_works, block, "phase2")) {
+            if (!eventReady(task->phase2_done_event)) {
+                lowbitBackendTiming(this, getRank(), "state phase2 event not ready");
                 break;
             }
+            lowbitBackendTiming(this, getRank(), std::string("state phase2 event ") + (block ? "wait done" : "ready"));
             launchLowBitRestore(task);
+            progressed = true;
             active_lowbit_tasks_.pop_front();
             if (target && task == target) {
                 if (block) {
@@ -774,12 +923,14 @@ bool ProcessGroupLowBit::progressLowBitTasks(
             if (!finishRestoreIfReady(task)) {
                 break;
             }
+            progressed = true;
             active_lowbit_tasks_.pop_front();
             if (target && task == target) {
                 return true;
             }
         } else {
             active_lowbit_tasks_.pop_front();
+            progressed = true;
             if (target && task == target) {
                 return true;
             }
@@ -787,7 +938,7 @@ bool ProcessGroupLowBit::progressLowBitTasks(
     }
 
     if (!target) {
-        return false;
+        return progressed;
     }
     if (target->phase == LowBitTaskPhase::kDone) {
         return true;
@@ -826,11 +977,16 @@ void ProcessGroupLowBit::launchLowBitPhase2(
     std::optional<c10::cuda::CUDAStream> stream;
     if (task->device_index.has_value()) {
         c10::cuda::CUDAGuard device_guard(*task->device_index);
-        stream = getLauncherStream(*task->device_index);
+        stream = getLowBitStream(*task->device_index, 1);
+        if (task->phase1_done_event) {
+            checkCuda(
+                cudaStreamWaitEvent(stream->stream(), task->phase1_done_event->event, 0),
+                "cudaStreamWaitEvent phase2");
+        }
     }
     c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
 
-    lowbitBackendTiming(this, getRank(), "state phase2 launch enter works=" + std::to_string(task->phase1_works.size()));
+    lowbitBackendTiming(this, getRank(), "state phase2 launch enter");
 
     c10d::AllgatherOptions allgather_opts;
     for (auto& s : task->tensors) {
@@ -889,8 +1045,32 @@ void ProcessGroupLowBit::launchLowBitPhase2(
         }
 
         std::vector<at::Tensor> packed_input = {s.reduced_packed};
-        task->phase2_works.push_back(
-            nccl_pg_->allgather(s.gathered_packed, packed_input, allgather_opts));
+        checkNccl(ncclGroupStart(), "ncclGroupStart phase2 packed");
+        for (int peer = 0; peer < task->world_size; ++peer) {
+            if (peer == task->rank) {
+                continue;
+            }
+            checkNccl(
+                ncclRecv(
+                    s.gathered_packed[0][peer].data_ptr(),
+                    s.gathered_packed[0][peer].numel(),
+                    ncclDataTypeFor(s.gathered_packed[0][peer]),
+                    peer,
+                    lowbit_comm_,
+                    stream->stream()),
+                "ncclRecv phase2 packed");
+            checkNccl(
+                ncclSend(
+                    s.reduced_packed.data_ptr(),
+                    s.reduced_packed.numel(),
+                    ncclDataTypeFor(s.reduced_packed),
+                    peer,
+                    lowbit_comm_,
+                    stream->stream()),
+                "ncclSend phase2 packed");
+        }
+        checkNccl(ncclGroupEnd(), "ncclGroupEnd phase2 packed");
+        s.gathered_packed[0][task->rank].copy_(s.reduced_packed);
         lowbitBackendTiming(this, getRank(), "state allgather packed launched");
 
         s.gathered_scales = std::vector<std::vector<at::Tensor>>(1);
@@ -900,13 +1080,43 @@ void ProcessGroupLowBit::launchLowBitPhase2(
         }
 
         std::vector<at::Tensor> scale_input = {s.reduced_scale};
-        task->phase2_works.push_back(
-            nccl_pg_->allgather(s.gathered_scales, scale_input, allgather_opts));
+        checkNccl(ncclGroupStart(), "ncclGroupStart phase2 scales");
+        for (int peer = 0; peer < task->world_size; ++peer) {
+            if (peer == task->rank) {
+                continue;
+            }
+            checkNccl(
+                ncclRecv(
+                    s.gathered_scales[0][peer].data_ptr(),
+                    s.gathered_scales[0][peer].numel(),
+                    ncclDataTypeFor(s.gathered_scales[0][peer]),
+                    peer,
+                    lowbit_comm_,
+                    stream->stream()),
+                "ncclRecv phase2 scales");
+            checkNccl(
+                ncclSend(
+                    s.reduced_scale.data_ptr(),
+                    s.reduced_scale.numel(),
+                    ncclDataTypeFor(s.reduced_scale),
+                    peer,
+                    lowbit_comm_,
+                    stream->stream()),
+                "ncclSend phase2 scales");
+        }
+        checkNccl(ncclGroupEnd(), "ncclGroupEnd phase2 scales");
+        s.gathered_scales[0][task->rank].copy_(s.reduced_scale);
         lowbitBackendTiming(this, getRank(), "state allgather scales launched");
     }
 
+    if (stream.has_value() && task->device_index.has_value()) {
+        task->phase2_done_event = std::make_shared<CudaEventHandle>(*task->device_index);
+        checkCuda(
+            cudaEventRecord(task->phase2_done_event->event, stream->stream()),
+            "cudaEventRecord phase2");
+    }
     task->phase = LowBitTaskPhase::kPhase2Launched;
-    lowbitBackendTiming(this, getRank(), "state phase2 launch exit works=" + std::to_string(task->phase2_works.size()));
+    lowbitBackendTiming(this, getRank(), "state phase2 launch exit");
 }
 
 void ProcessGroupLowBit::launchLowBitRestore(
@@ -914,11 +1124,16 @@ void ProcessGroupLowBit::launchLowBitRestore(
     std::optional<c10::cuda::CUDAStream> stream;
     if (task->device_index.has_value()) {
         c10::cuda::CUDAGuard device_guard(*task->device_index);
-        stream = getLauncherStream(*task->device_index);
+        stream = getLowBitStream(*task->device_index, 2);
+        if (task->phase2_done_event) {
+            checkCuda(
+                cudaStreamWaitEvent(stream->stream(), task->phase2_done_event->event, 0),
+                "cudaStreamWaitEvent restore");
+        }
     }
     c10::cuda::OptionalCUDAStreamGuard stream_guard(stream);
 
-    lowbitBackendTiming(this, getRank(), "state restore launch enter works=" + std::to_string(task->phase2_works.size()));
+    lowbitBackendTiming(this, getRank(), "state restore launch enter");
 
     for (auto& s : task->tensors) {
         std::vector<at::Tensor> out_shards;
@@ -1267,20 +1482,26 @@ void ProcessGroupLowBit::launcherLoop() {
 }
 
 c10::cuda::CUDAStream ProcessGroupLowBit::getLauncherStream(int device_index) {
+    return getLowBitStream(device_index, 0);
+}
+
+c10::cuda::CUDAStream ProcessGroupLowBit::getLowBitStream(int device_index, int slot) {
     c10::cuda::CUDAGuard device_guard(device_index);
-    auto it = launcher_streams_.find(device_index);
+    const int stream_key = device_index * 16 + slot;
+    auto it = launcher_streams_.find(stream_key);
     if (it != launcher_streams_.end()) {
         return *(it->second);
     }
 
     auto stream = c10::cuda::getStreamFromPool(false, device_index);
     auto inserted = launcher_streams_.emplace(
-        device_index,
+        stream_key,
         std::make_unique<c10::cuda::CUDAStream>(stream));
     lowbitBackendTiming(
         this,
         getRank(),
-        "created launcher stream device=" + std::to_string(device_index));
+        "created lowbit stream device=" + std::to_string(device_index) +
+            " slot=" + std::to_string(slot));
     return *(inserted.first->second);
 }
 

@@ -171,6 +171,42 @@ def _collect_library_dirs():
     return uniq
 
 
+def _find_shared_library(lib_dirs, names):
+    for directory in lib_dirs:
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def _lowbit_link_config():
+    library_dirs = _collect_library_dirs()
+    libraries = [
+        "torch",
+        "torch_cpu",
+        "torch_cuda",
+        "torch_python",
+        "c10",
+        "c10_cuda",
+    ]
+    extra_link_args = []
+
+    # Some pip/conda NCCL runtime packages ship libnccl.so.2 without the
+    # development symlink libnccl.so, so -lnccl cannot resolve. Link the
+    # concrete soname in that case.
+    if _find_shared_library(library_dirs, ["libnccl.so"]):
+        libraries.append("nccl")
+    else:
+        nccl_soname = _find_shared_library(library_dirs, ["libnccl.so.2"])
+        if nccl_soname:
+            extra_link_args.append(nccl_soname)
+        else:
+            libraries.append("nccl")
+
+    return library_dirs, libraries, extra_link_args
+
+
 def _cuda_compiler_from_env():
     return (
         os.environ.get("BITSCOM_CUDA_COMPILER")
@@ -253,6 +289,8 @@ class BuildExtensionWithCompileCommands(BuildExtension):
 
 _maybe_set_cuda_nvcc()
 
+_lowbit_library_dirs, _lowbit_libraries, _lowbit_extra_link_args = _lowbit_link_config()
+
 ext_modules = [
     CppExtension(
         name="bitscom._lowbit_c",
@@ -261,15 +299,9 @@ ext_modules = [
             "cpp/src/bindings.cc",
         ],
         include_dirs=_collect_include_dirs(),
-        library_dirs=_collect_library_dirs(),
-        libraries=[
-            "torch",
-            "torch_cpu",
-            "torch_cuda",
-            "torch_python",
-            "c10",
-            "c10_cuda",
-        ],
+        library_dirs=_lowbit_library_dirs,
+        libraries=_lowbit_libraries,
+        extra_link_args=_lowbit_extra_link_args,
         extra_compile_args={
             "cxx": ["-std=c++17", "-O2", "-DUSE_C10D_NCCL"],
         },

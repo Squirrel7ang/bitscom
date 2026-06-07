@@ -7,6 +7,7 @@
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <nccl.h>
 
 #include <condition_variable>
 #include <chrono>
@@ -146,6 +147,8 @@ public:
 private:
     // 底层 NCCL process group
     c10::intrusive_ptr<c10d::ProcessGroupNCCL> nccl_pg_;
+    c10::intrusive_ptr<c10d::Store> store_;
+    ncclComm_t lowbit_comm_ = nullptr;
 
     LowBitOptions options_;
 
@@ -188,6 +191,8 @@ private:
     void enqueueLowBitTask(std::function<void()> task);
     void launcherLoop();
     c10::cuda::CUDAStream getLauncherStream(int device_index);
+    c10::cuda::CUDAStream getLowBitStream(int device_index, int slot);
+    void initLowBitComm();
 
     bool useStage1ErrorFeedback() const;
     bool useStage2ErrorFeedback() const;
