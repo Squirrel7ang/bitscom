@@ -805,9 +805,9 @@ void ProcessGroupLowBit::launchLowBitPhase2(
 
     lowbitBackendTiming(this, getRank(), "state phase2 launch enter works=" + std::to_string(task->phase1_works.size()));
     for (auto& w : task->phase1_works) {
-        w->blockCurrentStream();
+        w->synchronize();
     }
-    lowbitBackendTiming(this, getRank(), "state phase1 blockCurrentStream done");
+    lowbitBackendTiming(this, getRank(), "state phase1 synchronize done");
 
     c10d::AllgatherOptions allgather_opts;
     for (auto& s : task->tensors) {
@@ -897,9 +897,9 @@ void ProcessGroupLowBit::launchLowBitRestore(
 
     lowbitBackendTiming(this, getRank(), "state restore launch enter works=" + std::to_string(task->phase2_works.size()));
     for (auto& w : task->phase2_works) {
-        w->blockCurrentStream();
+        w->synchronize();
     }
-    lowbitBackendTiming(this, getRank(), "state phase2 blockCurrentStream done");
+    lowbitBackendTiming(this, getRank(), "state phase2 synchronize done");
 
     for (auto& s : task->tensors) {
         std::vector<at::Tensor> out_shards;
