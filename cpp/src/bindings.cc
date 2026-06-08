@@ -50,6 +50,31 @@ PYBIND11_MODULE(_lowbit_c, m) {
         .def_readwrite("block_size", &bitscom::LowBitOptions::block_size)
         .def_readwrite("stage2_error_feedback", &bitscom::LowBitOptions::stage2_error_feedback);
 
+    py::class_<bitscom::LowBitScheduledHandle, std::shared_ptr<bitscom::LowBitScheduledHandle>>(
+        m,
+        "LowBitScheduledHandle")
+        .def("launch_phase2", [](const std::shared_ptr<bitscom::LowBitScheduledHandle>& handle) {
+            return handle->owner->launchScheduledLowBitPhase2(handle);
+        })
+        .def("launch_restore", [](const std::shared_ptr<bitscom::LowBitScheduledHandle>& handle) {
+            return handle->owner->launchScheduledLowBitRestore(handle);
+        })
+        .def(
+            "is_completed",
+            [](const std::shared_ptr<bitscom::LowBitScheduledHandle>& handle) {
+                return handle->owner->scheduledLowBitIsCompleted(handle, false);
+            })
+        .def(
+            "wait",
+            [](const std::shared_ptr<bitscom::LowBitScheduledHandle>& handle) {
+                return handle->owner->scheduledLowBitWait(handle);
+            })
+        .def(
+            "block_current_stream",
+            [](const std::shared_ptr<bitscom::LowBitScheduledHandle>& handle) {
+                return handle->owner->scheduledLowBitBlockCurrentStream(handle);
+            });
+
     // 暴露 ProcessGroupLowBit（作为 Backend 的子类）
     py::class_<
         bitscom::ProcessGroupLowBit,
@@ -70,7 +95,32 @@ PYBIND11_MODULE(_lowbit_c, m) {
         .def(
             "progress_lowbit",
             &bitscom::ProcessGroupLowBit::progressLowBit,
-            py::arg("block") = false);
+            py::arg("block") = false)
+        .def(
+            "schedule_lowbit_allreduce",
+            &bitscom::ProcessGroupLowBit::scheduleLowBitAllreduce,
+            py::arg("tensor"))
+        .def(
+            "launch_scheduled_lowbit_phase2",
+            &bitscom::ProcessGroupLowBit::launchScheduledLowBitPhase2,
+            py::arg("handle"))
+        .def(
+            "launch_scheduled_lowbit_restore",
+            &bitscom::ProcessGroupLowBit::launchScheduledLowBitRestore,
+            py::arg("handle"))
+        .def(
+            "scheduled_lowbit_is_completed",
+            &bitscom::ProcessGroupLowBit::scheduledLowBitIsCompleted,
+            py::arg("handle"),
+            py::arg("block") = false)
+        .def(
+            "scheduled_lowbit_wait",
+            &bitscom::ProcessGroupLowBit::scheduledLowBitWait,
+            py::arg("handle"))
+        .def(
+            "scheduled_lowbit_block_current_stream",
+            &bitscom::ProcessGroupLowBit::scheduledLowBitBlockCurrentStream,
+            py::arg("handle"));
 
     // 暴露工厂函数
     m.def("create_backend", &createBackend,

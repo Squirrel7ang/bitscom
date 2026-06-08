@@ -626,6 +626,23 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
     const c10d::AllreduceOptions& opts,
     std::optional<int> device_index,
     std::shared_ptr<CudaEventHandle> ready_event) {
+    (void)opts;
+    auto task = launchLowBitPhase1Ordered(
+        std::move(tensors),
+        device_index,
+        std::move(ready_event),
+        true);
+    auto progress_fn = [this, task](bool block) mutable -> bool {
+        return progressLowBitTasks(task, block);
+    };
+    return c10::make_intrusive<WorkBitscom>(std::move(progress_fn));
+}
+
+std::shared_ptr<LowBitAllreduceTask> ProcessGroupLowBit::launchLowBitPhase1Ordered(
+    std::vector<at::Tensor> tensors,
+    std::optional<int> device_index,
+    std::shared_ptr<CudaEventHandle> ready_event,
+    bool track_for_progress) {
     std::optional<c10::cuda::CUDAStream> launcher_stream;
     if (device_index.has_value()) {
         c10::cuda::CUDAGuard device_guard(*device_index);
@@ -646,7 +663,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
             (device_index.has_value() ? " device=" + std::to_string(*device_index) : ""));
 
     if (tensors.empty()) {
-        return nccl_pg_->allreduce(tensors, opts);
+        auto task = std::make_shared<LowBitAllreduceTask>();
+        task->phase = LowBitTaskPhase::kDone;
+        return task;
     }
 
     auto task = std::make_shared<LowBitAllreduceTask>();
@@ -834,15 +853,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(
         lowbitBackendTiming(this, getRank(), "state phase1 done event recorded");
     }
 
-    {
+    if (track_for_progress) {
         std::lock_guard<std::mutex> lock(lowbit_progress_mutex_);
         active_lowbit_tasks_.push_back(task);
     }
-
-    auto progress_fn = [this, task](bool block) mutable -> bool {
-        return progressLowBitTasks(task, block);
-    };
-    return c10::make_intrusive<WorkBitscom>(std::move(progress_fn));
+    return task;
 }
 
 bool ProcessGroupLowBit::progressLowBitTasks(
@@ -952,6 +967,121 @@ bool ProcessGroupLowBit::progressLowBitTasks(
 
 bool ProcessGroupLowBit::progressLowBit(bool block) {
     return progressLowBitTasks(nullptr, block);
+}
+
+std::shared_ptr<LowBitScheduledHandle> ProcessGroupLowBit::scheduleLowBitAllreduce(
+    at::Tensor tensor) {
+    std::vector<at::Tensor> tensors = {tensor};
+    std::optional<int> device_index;
+    std::shared_ptr<CudaEventHandle> ready_event;
+    if (tensor.defined() && tensor.is_cuda()) {
+        device_index = tensor.device().index();
+        c10::cuda::CUDAGuard device_guard(*device_index);
+        auto producer_stream = c10::cuda::getCurrentCUDAStream(*device_index);
+        ready_event = std::make_shared<CudaEventHandle>(*device_index);
+        checkCuda(
+            cudaEventRecord(ready_event->event, producer_stream.stream()),
+            "cudaEventRecord scheduled ready");
+    }
+
+    auto task = launchLowBitPhase1Ordered(
+        std::move(tensors),
+        device_index,
+        std::move(ready_event),
+        false);
+    auto handle = std::make_shared<LowBitScheduledHandle>();
+    handle->owner = this;
+    handle->task = std::move(task);
+    lowbitBackendTiming(
+        this,
+        getRank(),
+        "scheduled lowbit phase1 launched numel=" + std::to_string(tensor.numel()));
+    return handle;
+}
+
+bool ProcessGroupLowBit::launchScheduledLowBitPhase2(
+    const std::shared_ptr<LowBitScheduledHandle>& handle) {
+    TORCH_CHECK(handle && handle->owner == this && handle->task, "invalid lowbit scheduled handle");
+    std::lock_guard<std::mutex> lock(lowbit_progress_mutex_);
+    auto task = handle->task;
+    if (task->phase == LowBitTaskPhase::kDone ||
+        task->phase == LowBitTaskPhase::kRestoreLaunched ||
+        task->phase == LowBitTaskPhase::kPhase2Launched) {
+        return false;
+    }
+    TORCH_CHECK(
+        task->phase == LowBitTaskPhase::kPhase1Launched,
+        "cannot launch lowbit phase2 from current phase");
+    launchLowBitPhase2(task);
+    return true;
+}
+
+bool ProcessGroupLowBit::launchScheduledLowBitRestore(
+    const std::shared_ptr<LowBitScheduledHandle>& handle) {
+    TORCH_CHECK(handle && handle->owner == this && handle->task, "invalid lowbit scheduled handle");
+    std::lock_guard<std::mutex> lock(lowbit_progress_mutex_);
+    auto task = handle->task;
+    if (task->phase == LowBitTaskPhase::kDone ||
+        task->phase == LowBitTaskPhase::kRestoreLaunched) {
+        return false;
+    }
+    if (task->phase == LowBitTaskPhase::kPhase1Launched) {
+        launchLowBitPhase2(task);
+    }
+    TORCH_CHECK(
+        task->phase == LowBitTaskPhase::kPhase2Launched,
+        "cannot launch lowbit restore from current phase");
+    launchLowBitRestore(task);
+    return true;
+}
+
+bool ProcessGroupLowBit::scheduledLowBitIsCompleted(
+    const std::shared_ptr<LowBitScheduledHandle>& handle,
+    bool block) {
+    TORCH_CHECK(handle && handle->owner == this && handle->task, "invalid lowbit scheduled handle");
+    auto task = handle->task;
+    if (task->phase == LowBitTaskPhase::kDone) {
+        return true;
+    }
+    if (task->phase != LowBitTaskPhase::kRestoreLaunched) {
+        return false;
+    }
+    if (task->done_event) {
+        c10::cuda::CUDAGuard device_guard(task->done_event->device_index);
+        if (block) {
+            checkCuda(cudaEventSynchronize(task->done_event->event), "cudaEventSynchronize scheduled done");
+        } else {
+            auto status = cudaEventQuery(task->done_event->event);
+            if (status == cudaErrorNotReady) {
+                return false;
+            }
+            checkCuda(status, "cudaEventQuery scheduled done");
+        }
+    }
+    task->phase = LowBitTaskPhase::kDone;
+    return true;
+}
+
+bool ProcessGroupLowBit::scheduledLowBitWait(
+    const std::shared_ptr<LowBitScheduledHandle>& handle) {
+    launchScheduledLowBitRestore(handle);
+    return scheduledLowBitIsCompleted(handle, true);
+}
+
+bool ProcessGroupLowBit::scheduledLowBitBlockCurrentStream(
+    const std::shared_ptr<LowBitScheduledHandle>& handle) {
+    TORCH_CHECK(handle && handle->owner == this && handle->task, "invalid lowbit scheduled handle");
+    launchScheduledLowBitRestore(handle);
+    auto task = handle->task;
+    if (task->phase == LowBitTaskPhase::kDone || !task->done_event) {
+        return true;
+    }
+    c10::cuda::CUDAGuard device_guard(task->done_event->device_index);
+    auto current_stream = c10::cuda::getCurrentCUDAStream(task->done_event->device_index);
+    checkCuda(
+        cudaStreamWaitEvent(current_stream.stream(), task->done_event->event, 0),
+        "cudaStreamWaitEvent scheduled done");
+    return true;
 }
 
 bool ProcessGroupLowBit::lowBitWorksReady(

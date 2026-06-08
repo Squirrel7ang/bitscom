@@ -366,6 +366,30 @@ class LowBitGroup:
             return False
         return bool(progress(bool(block)))
 
+    def schedule_lowbit_allreduce(self, tensor: torch.Tensor):
+        schedule = getattr(self.pg, "schedule_lowbit_allreduce", None)
+        if schedule is None:
+            raise RuntimeError("lowbit backend does not expose schedule_lowbit_allreduce")
+        return schedule(tensor)
+
+    def launch_lowbit_phase2(self, handle) -> bool:
+        launch = getattr(handle, "launch_phase2", None)
+        if launch is not None:
+            return bool(launch())
+        launch = getattr(self.pg, "launch_scheduled_lowbit_phase2", None)
+        if launch is None:
+            raise RuntimeError("lowbit backend does not expose launch_lowbit_phase2")
+        return bool(launch(handle))
+
+    def launch_lowbit_restore(self, handle) -> bool:
+        launch = getattr(handle, "launch_restore", None)
+        if launch is not None:
+            return bool(launch())
+        launch = getattr(self.pg, "launch_scheduled_lowbit_restore", None)
+        if launch is None:
+            raise RuntimeError("lowbit backend does not expose launch_lowbit_restore")
+        return bool(launch(handle))
+
     def _comm_debug_enabled(self) -> bool:
         return os.environ.get("BITSCOM_COMM_DEBUG", "0").lower() in {
             "1",

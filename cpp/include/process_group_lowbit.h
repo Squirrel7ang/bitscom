@@ -27,6 +27,12 @@ namespace bitscom {
 
 struct CudaEventHandle;
 struct LowBitAllreduceTask;
+class ProcessGroupLowBit;
+
+struct LowBitScheduledHandle {
+    ProcessGroupLowBit* owner = nullptr;
+    std::shared_ptr<LowBitAllreduceTask> task;
+};
 
 struct LowBitOptions {
     int bitwidth = 4;
@@ -143,6 +149,14 @@ public:
         const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
 
     bool progressLowBit(bool block = false);
+    std::shared_ptr<LowBitScheduledHandle> scheduleLowBitAllreduce(at::Tensor tensor);
+    bool launchScheduledLowBitPhase2(const std::shared_ptr<LowBitScheduledHandle>& handle);
+    bool launchScheduledLowBitRestore(const std::shared_ptr<LowBitScheduledHandle>& handle);
+    bool scheduledLowBitIsCompleted(
+        const std::shared_ptr<LowBitScheduledHandle>& handle,
+        bool block = false);
+    bool scheduledLowBitWait(const std::shared_ptr<LowBitScheduledHandle>& handle);
+    bool scheduledLowBitBlockCurrentStream(const std::shared_ptr<LowBitScheduledHandle>& handle);
 
 private:
     // 底层 NCCL process group
@@ -174,6 +188,11 @@ private:
         const c10d::AllreduceOptions& opts,
         std::optional<int> device_index,
         std::shared_ptr<CudaEventHandle> ready_event);
+    std::shared_ptr<LowBitAllreduceTask> launchLowBitPhase1Ordered(
+        std::vector<at::Tensor> tensors,
+        std::optional<int> device_index,
+        std::shared_ptr<CudaEventHandle> ready_event,
+        bool track_for_progress);
     bool progressLowBitTasks(
         const std::shared_ptr<LowBitAllreduceTask>& target,
         bool block);
