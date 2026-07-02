@@ -397,6 +397,41 @@ ProcessGroupLowBit::ProcessGroupLowBit(
     // cross-communicator launch ordering with the training runtime.
 }
 
+// ---- ITensorPartitionStrategy default implementation ----
+
+bool ITensorPartitionStrategy::prepare(
+    std::vector<at::Tensor>& tensors,
+    int rank,
+    int world_size,
+    ncclComm_t comm,
+    at::cuda::CUDAStream stream) {
+    (void)tensors;
+    (void)rank;
+    (void)world_size;
+    (void)comm;
+    (void)stream;
+    return true;  // default: no preprocessing needed
+}
+
+// ---- Partition Strategy Management ----
+
+void ProcessGroupLowBit::setPartitionStrategy(
+    std::shared_ptr<ITensorPartitionStrategy> strategy) {
+    partition_strategy_ = std::move(strategy);
+    if (partition_strategy_) {
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            std::string("partition strategy set name=") + partition_strategy_->name());
+    } else {
+        lowbitBackendTiming(this, getRank(), "partition strategy cleared (full quantization)");
+    }
+}
+
+std::shared_ptr<ITensorPartitionStrategy> ProcessGroupLowBit::getPartitionStrategy() const {
+    return partition_strategy_;
+}
+
 ProcessGroupLowBit::~ProcessGroupLowBit() {
     lowbitBackendTiming(this, getRank(), "ProcessGroupLowBit destructor enter");
     if (lowbit_comm_ != nullptr) {
@@ -577,6 +612,34 @@ void ProcessGroupLowBit::initLowBitComm() {
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
     std::vector<at::Tensor>& tensors,
     const c10d::AllreduceOptions& opts) {
+
+    // ---- Sparse / selective quantization hook ----
+    if (partition_strategy_ && partition_strategy_->isActive()) {
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            std::string("allreduceLowBit sparse strategy active name=") +
+                partition_strategy_->name());
+        try {
+            return allreduceLowBitMixed(tensors, opts);
+        } catch (const std::exception& e) {
+            lowbitBackendTiming(
+                this,
+                getRank(),
+                std::string("allreduceLowBitMixed failed, falling back to full quantization. "
+                            "exception=") +
+                    e.what());
+            // Fall through to full-quantization path on error.
+        } catch (...) {
+            lowbitBackendTiming(
+                this,
+                getRank(),
+                "allreduceLowBitMixed failed with unknown exception, "
+                "falling back to full quantization.");
+        }
+    }
+    // ---- End sparse hook ----
+
     std::vector<at::Tensor> tensors_copy = tensors;
     std::optional<int> device_index;
     std::shared_ptr<CudaEventHandle> ready_event;
@@ -619,6 +682,287 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBit(
         work->markFailed(std::current_exception());
         return work;
     }
+}
+
+// ================================================================
+//  allreduceLowBitMixed
+//  Mixed dense + quantized allreduce driven by the partition strategy.
+// ================================================================
+
+c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceLowBitMixed(
+    std::vector<at::Tensor>& tensors,
+    const c10d::AllreduceOptions& opts) {
+
+    if (!partition_strategy_) {
+        // No strategy — should not happen, but safe fallback.
+        // Already not active, so no recursion guard needed.
+        return allreduceLowBit(tensors, opts);
+    }
+
+    // ---- Determine device info ----
+    std::optional<int> device_index;
+    if (!tensors.empty() && tensors[0].defined() && tensors[0].is_cuda()) {
+        device_index = tensors[0].device().index();
+    }
+
+    // ---- Call prepare() once ----
+    {
+        c10::cuda::CUDAGuard device_guard(
+            device_index.value_or(c10::cuda::current_device()));
+        std::optional<c10::cuda::CUDAStream> prep_stream;
+        if (device_index.has_value()) {
+            prep_stream = getLowBitStream(*device_index, 0);
+        }
+        bool ok = partition_strategy_->prepare(
+            tensors,
+            getRank(),
+            getSize(),
+            lowbit_comm_,
+            prep_stream.value_or(c10::cuda::getDefaultCUDAStream(*device_index)));
+        if (!ok) {
+            lowbitBackendTiming(
+                this, getRank(), "sparse strategy prepare() returned false, "
+                "falling back to full quantization.");
+            // Temporarily disable strategy to avoid recursion, then restore.
+            auto saved = std::move(partition_strategy_);
+            auto work = allreduceLowBit(tensors, opts);
+            partition_strategy_ = std::move(saved);
+            return work;
+        }
+    }
+
+    // ---- Process tensors ----
+    //
+    // For each tensor we partition it into quantized and dense segments,
+    // launch the appropriate allreduce, and collect works.
+    //
+    // After all works complete, results are scattered back into the
+    // original tensors.
+    //
+    struct MixedState {
+        at::Tensor original;
+        at::Tensor flat;                     // flat view of original
+        at::Tensor quant_buf;                // concatenated quantized segments
+        at::Tensor dense_buf;                // concatenated dense segments
+        std::vector<QuantizationSegment> segments;
+        c10::intrusive_ptr<c10d::Work> quant_work;
+        c10::intrusive_ptr<c10d::Work> dense_work;
+    };
+
+    auto state = std::make_shared<std::vector<MixedState>>();
+    state->reserve(tensors.size());
+
+    bool any_mixed = false;
+
+    for (auto& tensor : tensors) {
+        MixedState ms;
+        ms.original = tensor;
+        ms.flat = tensor.contiguous().view(-1);
+        ms.segments = partition_strategy_->partition(ms.flat);
+
+        int64_t total = 0;
+        for (auto& seg : ms.segments) {
+            total += seg.numel;
+        }
+        TORCH_CHECK(
+            total == ms.flat.numel(),
+            "partition strategy ", partition_strategy_->name(),
+            " returned segments covering ", total,
+            " elements, but tensor has ", ms.flat.numel());
+
+        // ---- Classify segments ----
+        // Skip dropped segments (sparsification: not communicated, zero-filled).
+        bool all_quant   = true;
+        bool all_dense   = true;
+        bool any_dropped = false;
+        for (auto& seg : ms.segments) {
+            if (seg.drop) { any_dropped = true; continue; }
+            if (!seg.quantize) all_quant = false;
+            if (seg.quantize)  all_dense = false;
+        }
+
+        // ---- Fast path: all quantized, no dropped segments ----
+        if (all_quant && !any_dropped) {
+            ms.quant_buf = ms.flat;  // entire tensor is quantized
+            state->push_back(std::move(ms));
+            continue;
+        }
+
+        // ---- Fast path: all dense, no dropped segments ----
+        if (all_dense && !any_dropped) {
+            ms.dense_buf = ms.flat;
+            state->push_back(std::move(ms));
+            continue;
+        }
+
+        // ---- Build quant/dense buffers from individual segments ----
+        // (mixed, or all-same-type with dropped segments interleaved)
+        any_mixed = true;
+        std::vector<at::Tensor> quant_parts, dense_parts;
+        for (auto& seg : ms.segments) {
+            if (seg.drop) continue;  // sparsified: skip communication
+            auto slice = ms.flat.slice(0, seg.offset, seg.offset + seg.numel);
+            if (seg.quantize) {
+                quant_parts.push_back(slice);
+            } else {
+                dense_parts.push_back(slice);
+            }
+        }
+
+        if (!quant_parts.empty()) {
+            ms.quant_buf = at::cat(quant_parts, 0);
+        }
+        if (!dense_parts.empty()) {
+            ms.dense_buf = at::cat(dense_parts, 0);
+        }
+
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            std::string("sparse partition name=") + partition_strategy_->name() +
+                " tensor_numel=" + std::to_string(ms.flat.numel()) +
+                " quant_numel=" + std::to_string(ms.quant_buf.defined() ? ms.quant_buf.numel() : 0) +
+                " dense_numel=" + std::to_string(ms.dense_buf.defined() ? ms.dense_buf.numel() : 0));
+
+        state->push_back(std::move(ms));
+    }
+
+    // ---- Collect quantized tensors for batch processing ----
+    std::vector<at::Tensor> quant_tensors;
+    for (auto& s : *state) {
+        if (s.quant_buf.defined() && s.quant_buf.numel() > 0) {
+            quant_tensors.push_back(s.quant_buf);
+        }
+    }
+
+    // ---- Collect dense tensors for batch processing ----
+    std::vector<at::Tensor> dense_tensors;
+    for (auto& s : *state) {
+        if (s.dense_buf.defined() && s.dense_buf.numel() > 0) {
+            dense_tensors.push_back(s.dense_buf);
+        }
+    }
+
+    // ---- Launch allreduce on each group ----
+    c10::intrusive_ptr<c10d::Work> quant_work;
+    c10::intrusive_ptr<c10d::Work> dense_work;
+
+    if (!quant_tensors.empty()) {
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "sparse launching lowbit allreduce on " +
+                std::to_string(quant_tensors.size()) + " quantized tensors");
+        // Temporarily disable the strategy so the nested allreduceLowBit
+        // call uses the pure full-quantization path (no recursion).
+        auto saved_strategy = partition_strategy_;
+        partition_strategy_.reset();
+        quant_work = allreduceLowBit(quant_tensors, opts);
+        partition_strategy_ = std::move(saved_strategy);
+    }
+
+    if (!dense_tensors.empty()) {
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "sparse launching dense NCCL allreduce on " +
+                std::to_string(dense_tensors.size()) + " dense tensors");
+        dense_work = nccl_pg_->allreduce(dense_tensors, opts);
+    }
+
+    // ---- If no mixed tensors, return the appropriate work directly ----
+    if (!any_mixed) {
+        // All tensors were either all-quantized or all-dense.
+        // Return the work that covers all tensors.
+        // (both works are non-null if we had some all-quant and some all-dense tensors)
+        if (quant_work && dense_work) {
+            // Both types exist, create a composite.
+            auto wait_fn = [this, quant_work, dense_work, state]() -> bool {
+                if (!quant_work->wait()) return false;
+                if (!dense_work->wait()) return false;
+                // When all-quant or all-dense, the results are already in the
+                // correct buffers — we need to copy back to originals.
+                for (auto& s : *state) {
+                    if (s.quant_buf.defined() && s.quant_buf.numel() > 0 &&
+                        !s.dense_buf.defined()) {
+                        // All-quant: quant_buf IS the flat view of original
+                        s.original.copy_(s.quant_buf.view(s.original.sizes()));
+                    }
+                    if (s.dense_buf.defined() && s.dense_buf.numel() > 0 &&
+                        !s.quant_buf.defined()) {
+                        // All-dense
+                        s.original.copy_(s.dense_buf.view(s.original.sizes()));
+                    }
+                }
+                return true;
+            };
+            return c10::make_intrusive<WorkBitscom>(std::move(wait_fn));
+        }
+        if (quant_work) return quant_work;
+        if (dense_work) return dense_work;
+        // Should not reach here.
+        auto work = c10::make_intrusive<WorkBitscom>();
+        work->markCompleted(true);
+        return work;
+    }
+
+    // ---- Mixed case: wait for both, then scatter results back ----
+    auto scatter_fn = [this, quant_work, dense_work, state]() -> bool {
+        // Wait for lowbit work.
+        if (quant_work) {
+            if (!quant_work->wait()) {
+                return false;
+            }
+        }
+        // Wait for dense work.
+        if (dense_work) {
+            if (!dense_work->wait()) {
+                return false;
+            }
+        }
+
+        // Scatter results back to original tensors.
+        for (auto& s : *state) {
+            // Drop: zero-fill sparsified segments.
+            for (auto& seg : s.segments) {
+                if (!seg.drop) continue;
+                s.flat.slice(0, seg.offset, seg.offset + seg.numel).fill_(0);
+            }
+
+            // Scatter quantized results.
+            if (s.quant_buf.defined() && s.quant_buf.numel() > 0) {
+                int64_t q_off = 0;
+                for (auto& seg : s.segments) {
+                    if (seg.drop || !seg.quantize) continue;
+                    s.flat.slice(0, seg.offset, seg.offset + seg.numel)
+                        .copy_(s.quant_buf.slice(0, q_off, q_off + seg.numel));
+                    q_off += seg.numel;
+                }
+            }
+
+            // Scatter dense results.
+            if (s.dense_buf.defined() && s.dense_buf.numel() > 0) {
+                int64_t d_off = 0;
+                for (auto& seg : s.segments) {
+                    if (seg.drop || seg.quantize) continue;
+                    s.flat.slice(0, seg.offset, seg.offset + seg.numel)
+                        .copy_(s.dense_buf.slice(0, d_off, d_off + seg.numel));
+                    d_off += seg.numel;
+                }
+            }
+
+            // Write back from flat to original shape.
+            s.original.copy_(s.flat.view(s.original.sizes()));
+        }
+
+        lowbitBackendTiming(
+            this,
+            getRank(),
+            "sparse scatter done");
+        return true;
+    };
+
+    return c10::make_intrusive<WorkBitscom>(std::move(scatter_fn));
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::launchLowBitAllreduceOrdered(

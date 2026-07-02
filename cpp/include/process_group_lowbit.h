@@ -29,6 +29,66 @@ struct CudaEventHandle;
 struct LowBitAllreduceTask;
 class ProcessGroupLowBit;
 
+// ============================================================
+//  Sparse / Selective Quantization Strategy Interface
+// ============================================================
+
+/// Describes a contiguous segment of a flat tensor.
+/// The segment spans elements [offset, offset+numel).
+/// When `drop` is true the segment is not communicated at all and is filled
+/// with zero after the allreduce (sparsification).
+/// When `drop` is false:
+///   - `quantize = true`  → compressed via the low-bit pipeline.
+///   - `quantize = false` → communicated with a standard dense allreduce.
+struct QuantizationSegment {
+    int64_t offset   = 0;
+    int64_t numel    = 0;
+    bool    quantize = true;
+    bool    drop     = false;
+};
+
+/// Abstract strategy that decides which parts of a tensor are important
+/// (dense) vs compressible (quantized).
+///
+/// Usage:
+///   1. Subclass and implement prepare() / partition().
+///   2. Call pg->setPartitionStrategy(strategy) BEFORE the first allreduce.
+///   3. The allreduce pipeline calls prepare() once per invocation, then
+///      partition() for each tensor.
+///
+/// When `isActive()` returns false the existing full-quantization path is used.
+class ITensorPartitionStrategy {
+public:
+    virtual ~ITensorPartitionStrategy() = default;
+
+    /// Pre-processing hook. Called once before the tensors are processed.
+    /// May modify tensors in-place, perform collective communication, etc.
+    /// `comm` is the lowbit NCCL communicator (usable for priority exchange).
+    /// `stream` is the launcher CUDA stream.
+    /// Returns true to proceed with this strategy; false to fall back to
+    /// full quantization (e.g. when there are too few elements to benefit).
+    virtual bool prepare(
+        std::vector<at::Tensor>& tensors,
+        int rank,
+        int world_size,
+        ncclComm_t comm,
+        at::cuda::CUDAStream stream);
+
+    /// Partition a flat (1-D) tensor into segments.
+    /// The union of all segments MUST cover [0, tensor.numel()).
+    /// Segments are processed in order; quantized segments go through the
+    /// low-bit pipeline, dense segments go through NCCL allreduce.
+    virtual std::vector<QuantizationSegment> partition(
+        const at::Tensor& flat_tensor) = 0;
+
+    /// Human-readable name for logging / debugging.
+    virtual const char* name() const = 0;
+
+    /// Whether this strategy is active. When false the default full-
+    /// quantization path is used (equivalent to a single quantized segment).
+    virtual bool isActive() const { return true; }
+};
+
 struct LowBitScheduledHandle {
     ProcessGroupLowBit* owner = nullptr;
     std::shared_ptr<LowBitAllreduceTask> task;
@@ -158,6 +218,14 @@ public:
     bool scheduledLowBitWait(const std::shared_ptr<LowBitScheduledHandle>& handle);
     bool scheduledLowBitBlockCurrentStream(const std::shared_ptr<LowBitScheduledHandle>& handle);
 
+    // ---- Sparse / Selective Quantization Strategy ----
+
+    /// Set a tensor partition strategy for selective quantization.
+    /// Pass nullptr to revert to full quantization (default).
+    void setPartitionStrategy(
+        std::shared_ptr<ITensorPartitionStrategy> strategy);
+    std::shared_ptr<ITensorPartitionStrategy> getPartitionStrategy() const;
+
 private:
     // 底层 NCCL process group
     c10::intrusive_ptr<c10d::ProcessGroupNCCL> nccl_pg_;
@@ -181,6 +249,10 @@ private:
 
     bool shouldUseLowBitAllreduce(const c10d::AllreduceOptions& opts) const;
     c10::intrusive_ptr<c10d::Work> allreduceLowBit(
+        std::vector<at::Tensor>& tensors,
+        const c10d::AllreduceOptions& opts);
+    /// Mixed dense+quantized allreduce (used when partition_strategy_ is active).
+    c10::intrusive_ptr<c10d::Work> allreduceLowBitMixed(
         std::vector<at::Tensor>& tensors,
         const c10d::AllreduceOptions& opts);
     c10::intrusive_ptr<c10d::Work> launchLowBitAllreduceOrdered(
@@ -248,6 +320,9 @@ private:
           launcher_streams_;
       std::mutex lowbit_progress_mutex_;
       std::deque<std::shared_ptr<LowBitAllreduceTask>> active_lowbit_tasks_;
+
+      // Sparse / selective quantization strategy (nullptr → full quantization).
+      std::shared_ptr<ITensorPartitionStrategy> partition_strategy_;
 };
 
 // 工厂函数，用于 Python 侧 register_backend
