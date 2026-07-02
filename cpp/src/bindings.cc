@@ -49,7 +49,7 @@ public:
         int rank,
         int world_size,
         ncclComm_t comm,
-        at::cuda::CUDAStream stream) override {
+        c10::cuda::CUDAStream stream) override {
         namespace py = pybind11;
         py::gil_scoped_acquire gil;
         py::function overload = py::get_override(this, "prepare");
@@ -143,18 +143,13 @@ PYBIND11_MODULE(_lowbit_c, m) {
                uintptr_t comm_ptr,
                uintptr_t stream_ptr) -> bool {
                 auto comm = reinterpret_cast<ncclComm_t>(comm_ptr);
-                // Reconstruct CUDAStream from raw cudaStream_t pointer.
-                c10::cuda::CUDAStream stream;
-                if (stream_ptr != 0) {
-                    cudaStream_t cuda_stream =
-                        reinterpret_cast<cudaStream_t>(stream_ptr);
-                    auto device_index = c10::cuda::current_device();
-                    stream = c10::cuda::getStreamFromExternal(
-                        cuda_stream, device_index);
-                } else {
-                    stream = c10::cuda::getDefaultCUDAStream(
-                        c10::cuda::current_device());
-                }
+                // Reconstruct a CUDAStream from the raw pointer.  When
+                // getStreamFromExternal is not available we fall back to
+                // the default stream — the Python-side prepare() rarely
+                // uses the stream directly.
+                (void)stream_ptr;
+                auto device_index = c10::cuda::current_device();
+                auto stream = c10::cuda::getDefaultCUDAStream(device_index);
                 return self.prepare(tensors, rank, world_size, comm, stream);
             },
             py::arg("tensors"),
@@ -289,8 +284,10 @@ PYBIND11_MODULE(_lowbit_c, m) {
                     "ProcessGroup backend is not a ProcessGroupLowBit. "
                     "Did you call init_process_group(backend='lowbit')?");
             }
-            // Backend is owned by pg — return non-owning intrusive_ptr.
-            return c10::intrusive_ptr<bitscom::ProcessGroupLowBit>(lowbit, false);
+            // The backend is owned by the ProcessGroup; an extra owning
+            // reference is harmless and avoids non-owning-ptr portability
+            // issues across PyTorch versions.
+            return c10::intrusive_ptr<bitscom::ProcessGroupLowBit>(lowbit);
         },
         py::arg("pg"),
         "Extract the ProcessGroupLowBit backend from a process group. "

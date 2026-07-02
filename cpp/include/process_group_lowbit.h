@@ -72,7 +72,7 @@ public:
         int rank,
         int world_size,
         ncclComm_t comm,
-        at::cuda::CUDAStream stream);
+        c10::cuda::CUDAStream stream);
 
     /// Partition a flat (1-D) tensor into segments.
     /// The union of all segments MUST cover [0, tensor.numel()).

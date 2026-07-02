@@ -404,7 +404,7 @@ bool ITensorPartitionStrategy::prepare(
     int rank,
     int world_size,
     ncclComm_t comm,
-    at::cuda::CUDAStream stream) {
+    c10::cuda::CUDAStream stream) {
     (void)tensors;
     (void)rank;
     (void)world_size;
