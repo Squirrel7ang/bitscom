@@ -102,18 +102,24 @@ def make_all_dense_strategy(row_size: int):
 
 
 # ================================================================
-#  获取 ProcessGroupLowBit 后端对象
+#  ProcessGroupLowBit 后端操作（通过 C++ helper 间接访问）
 # ================================================================
 
-def get_lowbit_backend():
-    """
-    从默认 process group 中取出底层的 ProcessGroupLowBit C++ 对象。
-    仅在 init_process_group(backend="lowbit") 后可用。
-    """
-    from bitscom._lowbit_c import _get_lowbit_backend
+def get_default_pg():
+    """返回默认 process group。"""
+    return c10d._get_default_group()
 
-    default_pg = c10d._get_default_group()
-    return _get_lowbit_backend(default_pg)
+
+def set_strategy_on_pg(strategy):
+    """在默认 lowbit process group 上设置分区策略。传 None 清除策略。"""
+    from bitscom._lowbit_c import _set_strategy_on_pg
+    _set_strategy_on_pg(get_default_pg(), strategy)
+
+
+def get_strategy_name_from_pg() -> str:
+    """获取当前策略名称。"""
+    from bitscom._lowbit_c import _get_strategy_name_from_pg
+    return _get_strategy_name_from_pg(get_default_pg())
 
 
 def compute_dense_reference(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
@@ -153,12 +159,9 @@ def test_half_dense_correctness():
     )
 
     # ── 设置策略 ──
-    backend = get_lowbit_backend()
-    log(f"backend type: {type(backend).__name__}")
-
     strategy = make_half_dense_strategy(row_size=row_size)
-    backend.set_partition_strategy(strategy)
-    log(f"strategy: {backend.get_partition_strategy().name()}")
+    set_strategy_on_pg(strategy)
+    log(f"strategy: {get_strategy_name_from_pg()}")
 
     # ── 准备数据 ──
     torch.manual_seed(42 + rank)
@@ -210,7 +213,7 @@ def test_half_dense_correctness():
         ),
     )
     log("PASSED: half-dense correctness")
-    backend.set_partition_strategy(None)
+    set_strategy_on_pg(None)
 
 
 def test_all_dense_strategy():
@@ -225,8 +228,7 @@ def test_all_dense_strategy():
     num_rows = 64
     total_elements = num_rows * row_size
 
-    backend = get_lowbit_backend()
-    backend.set_partition_strategy(make_all_dense_strategy(row_size=row_size))
+    set_strategy_on_pg(make_all_dense_strategy(row_size=row_size))
 
     torch.manual_seed(123 + rank)
     tensor = torch.randn(total_elements, dtype=torch.float32, device=device)
@@ -242,7 +244,7 @@ def test_all_dense_strategy():
     # 全 dense 等价于 NCCL，应该严格一致
     torch.testing.assert_close(test_t, ref, rtol=1e-5, atol=1e-5)
     log("PASSED: all-dense strategy")
-    backend.set_partition_strategy(None)
+    set_strategy_on_pg(None)
 
 
 def test_full_quantization_fallback():
@@ -255,9 +257,8 @@ def test_full_quantization_fallback():
 
     from bitscom._lowbit_c import FullQuantizationStrategy
 
-    backend = get_lowbit_backend()
-    backend.set_partition_strategy(FullQuantizationStrategy())
-    log(f"strategy active: {backend.get_partition_strategy().is_active()}")
+    set_strategy_on_pg(FullQuantizationStrategy())
+    log(f"strategy name: {get_strategy_name_from_pg()}")
 
     row_size = 32
     num_rows = 64
@@ -273,33 +274,28 @@ def test_full_quantization_fallback():
 
     torch.testing.assert_close(test_t, ref, rtol=0.03, atol=0.5)
     log("PASSED: full-quantization fallback")
-    backend.set_partition_strategy(None)
+    set_strategy_on_pg(None)
 
 
 def test_strategy_clear_restore():
     """
     验证策略的 set → clear → re-set 生命周期。
     """
-    backend = get_lowbit_backend()
-
     # Set
-    s1 = make_all_dense_strategy(row_size=32)
-    backend.set_partition_strategy(s1)
-    assert backend.get_partition_strategy() is not None
-    assert backend.get_partition_strategy().name() == "all_dense"
+    set_strategy_on_pg(make_all_dense_strategy(row_size=32))
+    assert get_strategy_name_from_pg() == "all_dense"
 
     # Clear
-    backend.set_partition_strategy(None)
-    assert backend.get_partition_strategy() is None, \
-        "strategy should be None after clearing"
+    set_strategy_on_pg(None)
+    assert get_strategy_name_from_pg() == "none", \
+        "strategy should be 'none' after clearing"
 
     # Re-set
-    s2 = make_half_dense_strategy(row_size=32)
-    backend.set_partition_strategy(s2)
-    assert backend.get_partition_strategy() is not None
-    log(f"restored strategy: {backend.get_partition_strategy().name()}")
+    set_strategy_on_pg(make_half_dense_strategy(row_size=32))
+    assert get_strategy_name_from_pg() == "half_dense"
+    log(f"restored strategy: {get_strategy_name_from_pg()}")
 
-    backend.set_partition_strategy(None)
+    set_strategy_on_pg(None)
     log("PASSED: strategy clear/restore lifecycle")
 
 
@@ -390,9 +386,8 @@ def test_sparse_drop_strategy():
     num_rows = 128
     total_elements = num_rows * row_size
 
-    backend = get_lowbit_backend()
     strategy = make_sparse_drop_strategy(row_size=row_size, keep_ratio=0.6)
-    backend.set_partition_strategy(strategy)
+    set_strategy_on_pg(strategy)
 
     torch.manual_seed(99 + rank)
     tensor = torch.randn(total_elements, dtype=torch.float32, device=device)
@@ -436,7 +431,7 @@ def test_sparse_drop_strategy():
     log(f"drop rows: {len(drop_rows)}, keep rows: {len(keep_rows)}")
     log("PASSED: sparse drop strategy")
 
-    backend.set_partition_strategy(None)
+    set_strategy_on_pg(None)
 
 
 # ================================================================
@@ -527,7 +522,7 @@ def _select_topk_rows(tensor: torch.Tensor, num_rows: int, row_size: int,
 
 def _run_arctopk_test(row_size, num_rows, topk_ratio,
                        important_quantize, non_important_mode,
-                       label, rank, world_size, device, backend):
+                       label, rank, world_size, device):
     """通用 ARC-TOP-K 测试框架。"""
     total_elements = num_rows * row_size
     assert total_elements % world_size == 0
@@ -541,7 +536,7 @@ def _run_arctopk_test(row_size, num_rows, topk_ratio,
     # 2) 设策略
     strategy = make_arctopk_strategy(
         row_size, important_rows, important_quantize, non_important_mode)
-    backend.set_partition_strategy(strategy)
+    set_strategy_on_pg(strategy)
     log(f"[{label}] {strategy.name()} topk={len(important_rows)}/{num_rows}")
 
     # 3) 参考值
@@ -594,7 +589,7 @@ def _run_arctopk_test(row_size, num_rows, topk_ratio,
                 f"Non-important (quantized) error too large: {ni_max}"
 
     log(f"[{label}] PASSED")
-    backend.set_partition_strategy(None)
+    set_strategy_on_pg(None)
 
 
 def test_arctopk_v1_important_dense_ni_quantize():
@@ -606,8 +601,7 @@ def test_arctopk_v1_important_dense_ni_quantize():
         important_quantize=False, non_important_mode="quantize",
         label="v1:imp=dense,ni=quantize",
         rank=dist.get_rank(), world_size=dist.get_world_size(),
-        device=torch.device(f"cuda:{dist.get_rank()}"),
-        backend=get_lowbit_backend())
+        device=torch.device(f"cuda:{dist.get_rank()}"))
 
 
 def test_arctopk_v2_important_dense_ni_drop():
@@ -619,8 +613,7 @@ def test_arctopk_v2_important_dense_ni_drop():
         important_quantize=False, non_important_mode="drop",
         label="v2:imp=dense,ni=drop",
         rank=dist.get_rank(), world_size=dist.get_world_size(),
-        device=torch.device(f"cuda:{dist.get_rank()}"),
-        backend=get_lowbit_backend())
+        device=torch.device(f"cuda:{dist.get_rank()}"))
 
 
 def test_arctopk_v3_important_quantize_ni_drop():
@@ -633,8 +626,7 @@ def test_arctopk_v3_important_quantize_ni_drop():
         important_quantize=True, non_important_mode="drop",
         label="v3:imp=quantize,ni=drop",
         rank=dist.get_rank(), world_size=dist.get_world_size(),
-        device=torch.device(f"cuda:{dist.get_rank()}"),
-        backend=get_lowbit_backend())
+        device=torch.device(f"cuda:{dist.get_rank()}"))
 
 
 def test_arctopk_v4_important_quantize_ni_dense():
@@ -647,8 +639,7 @@ def test_arctopk_v4_important_quantize_ni_dense():
         important_quantize=True, non_important_mode="dense",
         label="v4:imp=quantize,ni=dense",
         rank=dist.get_rank(), world_size=dist.get_world_size(),
-        device=torch.device(f"cuda:{dist.get_rank()}"),
-        backend=get_lowbit_backend())
+        device=torch.device(f"cuda:{dist.get_rank()}"))
 
 
 def test_arctopk_v5_large():
@@ -661,8 +652,7 @@ def test_arctopk_v5_large():
         important_quantize=False, non_important_mode="quantize",
         label="v5:large imp=dense,ni=quantize",
         rank=dist.get_rank(), world_size=dist.get_world_size(),
-        device=torch.device(f"cuda:{dist.get_rank()}"),
-        backend=get_lowbit_backend())
+        device=torch.device(f"cuda:{dist.get_rank()}"))
 
 
 # ================================================================

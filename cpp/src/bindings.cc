@@ -271,11 +271,11 @@ PYBIND11_MODULE(_lowbit_c, m) {
             &bitscom::ProcessGroupLowBit::getPartitionStrategy,
             "Get the current partition strategy (may be None).");
 
-    // Helper: 从 ProcessGroup 中提取 ProcessGroupLowBit 后端（用于测试/调试）
+    // Helper: 在 ProcessGroup 的 lowbit backend 上设置策略。
     m.def(
-        "_get_lowbit_backend",
-        [](const c10::intrusive_ptr<c10d::ProcessGroup>& pg)
-            -> c10::intrusive_ptr<bitscom::ProcessGroupLowBit> {
+        "_set_strategy_on_pg",
+        [](const c10::intrusive_ptr<c10d::ProcessGroup>& pg,
+           std::shared_ptr<bitscom::ITensorPartitionStrategy> strategy) {
             auto backend = pg->getBackend(c10::DeviceType::CUDA);
             auto lowbit =
                 dynamic_cast<bitscom::ProcessGroupLowBit*>(backend.get());
@@ -284,14 +284,30 @@ PYBIND11_MODULE(_lowbit_c, m) {
                     "ProcessGroup backend is not a ProcessGroupLowBit. "
                     "Did you call init_process_group(backend='lowbit')?");
             }
-            // The backend is owned by the ProcessGroup; an extra owning
-            // reference is harmless and avoids non-owning-ptr portability
-            // issues across PyTorch versions.
-            return c10::intrusive_ptr<bitscom::ProcessGroupLowBit>(lowbit);
+            lowbit->setPartitionStrategy(std::move(strategy));
         },
         py::arg("pg"),
-        "Extract the ProcessGroupLowBit backend from a process group. "
-        "Only valid when the group was created with backend='lowbit'.");
+        py::arg("strategy"),
+        "Set a partition strategy on a lowbit-backed process group.");
+
+    // Helper: 从 ProcessGroup 获取策略名称（用于测试验证）。
+    m.def(
+        "_get_strategy_name_from_pg",
+        [](const c10::intrusive_ptr<c10d::ProcessGroup>& pg) -> std::string {
+            auto backend = pg->getBackend(c10::DeviceType::CUDA);
+            auto lowbit =
+                dynamic_cast<bitscom::ProcessGroupLowBit*>(backend.get());
+            if (!lowbit) {
+                throw std::runtime_error(
+                    "ProcessGroup backend is not a ProcessGroupLowBit.");
+            }
+            auto s = lowbit->getPartitionStrategy();
+            if (!s) return "none";
+            return std::string(s->name());
+        },
+        py::arg("pg"),
+        "Get the name of the current partition strategy on a lowbit-backed "
+        "process group.");
 
     // 暴露工厂函数
     m.def("create_backend", &createBackend,
