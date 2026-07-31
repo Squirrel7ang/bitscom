@@ -37,6 +37,13 @@ def init(
     error_feedback_mode: str | None = None,
     block_size: int = DEFAULT_BLOCK_SIZE,
     stage2_error_feedback: bool | None = None,
+    sparse_enabled: bool = False,
+    sparse_projection_rank: int = 4,
+    sparse_compression_ratio: float = 0.1,
+    sparse_priority_mode: int = 0,       # 0=kFull, 1=kQuantize, 2=kDiscard
+    sparse_priority_quantize_bitwidth: int = 4,
+    sparse_non_priority_mode: int = 1,   # 0=kFull, 1=kQuantize, 2=kDiscard
+    sparse_non_priority_quantize_bitwidth: int = 4,
 ):
     """
     初始化 bitscom：注册 lowbit backend。
@@ -48,4 +55,11 @@ def init(
         error_feedback_mode=error_feedback_mode,
         block_size=block_size,
         stage2_error_feedback=stage2_error_feedback,
+        sparse_enabled=sparse_enabled,
+        sparse_projection_rank=sparse_projection_rank,
+        sparse_compression_ratio=sparse_compression_ratio,
+        sparse_priority_mode=sparse_priority_mode,
+        sparse_priority_quantize_bitwidth=sparse_priority_quantize_bitwidth,
+        sparse_non_priority_mode=sparse_non_priority_mode,
+        sparse_non_priority_quantize_bitwidth=sparse_non_priority_quantize_bitwidth,
     )

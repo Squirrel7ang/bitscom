@@ -33,6 +33,15 @@ _BACKEND_ERROR_FEEDBACK_MODE = "none"
 _BACKEND_BLOCK_SIZE = DEFAULT_BLOCK_SIZE
 _BACKEND_STAGE2_ERROR_FEEDBACK = False
 
+# 稀疏化 ARC-Top-K 配置
+_BACKEND_SPARSE_ENABLED = False
+_BACKEND_SPARSE_PROJECTION_RANK = 4
+_BACKEND_SPARSE_COMPRESSION_RATIO = 0.1
+_BACKEND_SPARSE_PRIORITY_MODE = 0       # SparseCommMode::kFull
+_BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH = 4
+_BACKEND_SPARSE_NON_PRIORITY_MODE = 1   # SparseCommMode::kQuantize
+_BACKEND_SPARSE_NON_PRIORITY_QUANTIZE_BITWIDTH = 4
+
 _VALID_EF_MODES = {
     "auto",
     "none",
@@ -64,6 +73,13 @@ def _create_lowbit_pg(store, rank, size, timeout):
         error_feedback_mode=_BACKEND_ERROR_FEEDBACK_MODE,
         block_size=_BACKEND_BLOCK_SIZE,
         stage2_error_feedback=_BACKEND_STAGE2_ERROR_FEEDBACK,
+        sparse_enabled=_BACKEND_SPARSE_ENABLED,
+        sparse_projection_rank=_BACKEND_SPARSE_PROJECTION_RANK,
+        sparse_compression_ratio=_BACKEND_SPARSE_COMPRESSION_RATIO,
+        sparse_priority_mode=_BACKEND_SPARSE_PRIORITY_MODE,
+        sparse_priority_quantize_bitwidth=_BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH,
+        sparse_non_priority_mode=_BACKEND_SPARSE_NON_PRIORITY_MODE,
+        sparse_non_priority_quantize_bitwidth=_BACKEND_SPARSE_NON_PRIORITY_QUANTIZE_BITWIDTH,
     )
 
 
@@ -89,15 +105,21 @@ def register_lowbit_backend(
     error_feedback_mode: str | None = None,
     block_size: int = DEFAULT_BLOCK_SIZE,
     stage2_error_feedback: bool | None = None,
+    sparse_enabled: bool = False,
+    sparse_projection_rank: int = 4,
+    sparse_compression_ratio: float = 0.1,
+    sparse_priority_mode: int = 0,       # SparseCommMode: 0=kFull, 1=kQuantize, 2=kDiscard
+    sparse_priority_quantize_bitwidth: int = 4,
+    sparse_non_priority_mode: int = 1,   # SparseCommMode: 0=kFull, 1=kQuantize, 2=kDiscard
+    sparse_non_priority_quantize_bitwidth: int = 4,
 ):
     """
     将 'lowbit' 注册为 torch.distributed 的可用 backend。
-    注册后即可使用:
-        dist.init_process_group(backend="lowbit", ...)
 
-    error_feedback_mode: none / legacy / ef21 / ef21_plus
-    block_size: block quantization size
-    stage2_error_feedback: enable error feedback on the second quantization stage
+    sparse_priority_mode / sparse_non_priority_mode:
+        0 = full (全精度 NCCL allreduce)
+        1 = quantize (量化通信，位宽由对应的 quantize_bitwidth 决定)
+        2 = discard (舍弃，直接置零)
     """
     global _REGISTERED
     global _BACKEND_BITWIDTH
@@ -105,6 +127,13 @@ def register_lowbit_backend(
     global _BACKEND_ERROR_FEEDBACK_MODE
     global _BACKEND_BLOCK_SIZE
     global _BACKEND_STAGE2_ERROR_FEEDBACK
+    global _BACKEND_SPARSE_ENABLED
+    global _BACKEND_SPARSE_PROJECTION_RANK
+    global _BACKEND_SPARSE_COMPRESSION_RATIO
+    global _BACKEND_SPARSE_PRIORITY_MODE
+    global _BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH
+    global _BACKEND_SPARSE_NON_PRIORITY_MODE
+    global _BACKEND_SPARSE_NON_PRIORITY_QUANTIZE_BITWIDTH
 
     if bitwidth not in (1, 2, 4, 8, 12, 16):
         raise ValueError(
@@ -133,14 +162,16 @@ def register_lowbit_backend(
             or resolved_mode != _BACKEND_ERROR_FEEDBACK_MODE
             or block_size != _BACKEND_BLOCK_SIZE
             or resolved_stage2 != _BACKEND_STAGE2_ERROR_FEEDBACK
+            or sparse_enabled != _BACKEND_SPARSE_ENABLED
+            or sparse_projection_rank != _BACKEND_SPARSE_PROJECTION_RANK
+            or sparse_compression_ratio != _BACKEND_SPARSE_COMPRESSION_RATIO
+            or sparse_priority_mode != _BACKEND_SPARSE_PRIORITY_MODE
+            or sparse_priority_quantize_bitwidth != _BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH
+            or sparse_non_priority_mode != _BACKEND_SPARSE_NON_PRIORITY_MODE
+            or sparse_non_priority_quantize_bitwidth != _BACKEND_SPARSE_NON_PRIORITY_QUANTIZE_BITWIDTH
         ):
             raise RuntimeError(
-                "lowbit backend is already registered with different options: "
-                f"bitwidth={_BACKEND_BITWIDTH}, you specified bitwidth={bitwidth}, "
-                f"error_feedback={_BACKEND_ERROR_FEEDBACK}, you specified error_feedback={error_feedback}, "
-                f"error_feedback_mode={_BACKEND_ERROR_FEEDBACK_MODE}, you specified error_feedback_mode={error_feedback_mode}, "
-                f"block_size={_BACKEND_BLOCK_SIZE}, you specified block_size={block_size}, "
-                f"stage2_error_feedback={_BACKEND_STAGE2_ERROR_FEEDBACK}, you specified stage2_error_feedback={resolved_stage2}"
+                "lowbit backend is already registered with different options"
             )
         return
 
@@ -149,6 +180,13 @@ def register_lowbit_backend(
     _BACKEND_ERROR_FEEDBACK_MODE = resolved_mode
     _BACKEND_BLOCK_SIZE = int(block_size)
     _BACKEND_STAGE2_ERROR_FEEDBACK = resolved_stage2
+    _BACKEND_SPARSE_ENABLED = bool(sparse_enabled)
+    _BACKEND_SPARSE_PROJECTION_RANK = int(sparse_projection_rank)
+    _BACKEND_SPARSE_COMPRESSION_RATIO = float(sparse_compression_ratio)
+    _BACKEND_SPARSE_PRIORITY_MODE = int(sparse_priority_mode)
+    _BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH = int(sparse_priority_quantize_bitwidth)
+    _BACKEND_SPARSE_NON_PRIORITY_MODE = int(sparse_non_priority_mode)
+    _BACKEND_SPARSE_NON_PRIORITY_QUANTIZE_BITWIDTH = int(sparse_non_priority_quantize_bitwidth)
 
     if not _HAS_EXTENSION:
         raise RuntimeError(

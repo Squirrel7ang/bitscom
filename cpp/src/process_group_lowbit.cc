@@ -123,6 +123,16 @@ ncclDataType_t ncclDataTypeFor(const at::Tensor& tensor) {
     }
 }
 
+// 找到 size 的最大 2 的幂因子，用于将 1D tensor reshape 为 n×m 矩阵
+// 要求 factor 整除 size 且 size/factor > factor（保证矩阵不太扁）
+int64_t calMaxFactor(int64_t size) {
+    int64_t factor = 1;
+    while (size % factor == 0 && size / factor > factor) {
+        factor *= 2;
+    }
+    return factor;
+}
+
 }  // namespace
 
 struct CudaEventHandle {
@@ -1642,6 +1652,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduce(
     std::vector<at::Tensor>& tensors,
     const c10d::AllreduceOptions& opts) {
 
+    // 稀疏化 ARC-Top-K 路径：与现有 lowbit 路径完全独立的选路
+    if (shouldUseSparseAllreduce(opts)) {
+        return allreduceSparse(tensors, opts);
+    }
+
     if (shouldUseLowBitAllreduce(opts)) {
         return allreduceLowBit(tensors, opts);
     }
@@ -1801,6 +1816,399 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::alltoall_base(
         opts);
 }
 
+// ==================== 稀疏化 ARC-Top-K Allreduce ====================
+
+// ---- pack/unpack 重载：显式指定位宽（稀疏化路径用）----
+
+std::tuple<at::Tensor, at::Tensor> ProcessGroupLowBit::pack(
+    const at::Tensor& input, int bitwidth) {
+    auto flat = input.contiguous().view(-1).to(at::kFloat);
+    TORCH_CHECK(
+        bitwidth == 1 || bitwidth == 2 || bitwidth == 4 || bitwidth >= 8,
+        "unsupported bitwidth for pack: ", bitwidth);
+
+    if (bitwidth >= 8) {
+        auto scale = at::ones({1}, flat.options());
+        auto packed = flat.to(at::kHalf).view(at::kByte).contiguous();
+        return std::make_tuple(packed, scale);
+    }
+
+    const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
+    const int qmax = (bitwidth == 1) ? 1 : ((1 << (bitwidth - 1)) - 1);
+    const int64_t numel = flat.numel();
+    if (numel == 0) {
+        auto scale = at::empty({0}, flat.options().dtype(at::kHalf));
+        auto packed = at::empty({0}, flat.options().dtype(at::kByte));
+        return std::make_tuple(packed, scale);
+    }
+
+    const int64_t block_size = options_.block_size;
+    const int64_t num_blocks = (numel + block_size - 1) / block_size;
+    const int64_t padded = num_blocks * block_size;
+    if (padded != numel) {
+        auto zeros = at::zeros({padded - numel}, flat.options());
+        flat = at::cat({flat, zeros}, 0);
+    }
+
+    auto blocks = flat.view({num_blocks, block_size});
+    auto abs_blocks = at::abs(blocks);
+    auto max_abs = std::get<0>(abs_blocks.max(1));
+    auto scale = max_abs / static_cast<float>(qmax);
+    scale = at::where(max_abs > 0, scale, at::ones_like(scale));
+    auto scale_half = scale.to(at::kHalf);
+
+    auto scale_f = scale_half.to(at::kFloat);
+    auto normalized = abs_blocks / scale_f.unsqueeze(1);
+    auto mag = at::round(normalized);
+    auto signed_vals = (bitwidth == 1) ? mag : mag * at::sign(blocks);
+    auto q = signed_vals.clamp(qmin, qmax).to(at::kInt);
+    auto values = (q.view({-1}).slice(0, 0, numel) - qmin)
+                      .to(at::kInt)
+                      .contiguous()
+                      .view(-1);
+
+    const int per_byte = 8 / bitwidth;
+    const int64_t packed_numel = values.numel();
+    const int64_t pad = (per_byte - (packed_numel % per_byte)) % per_byte;
+    if (pad > 0) {
+        auto zeros = at::zeros({pad}, values.options());
+        values = at::cat({values, zeros}, 0);
+    }
+
+    values = values.view({-1, per_byte});
+    auto shifts = at::arange(0, per_byte, values.options()) * bitwidth;
+    auto packed = at::sum(at::bitwise_left_shift(values, shifts), 1).to(at::kByte);
+    return std::make_tuple(packed.contiguous(), scale_half);
+}
+
+at::Tensor ProcessGroupLowBit::unpack(
+    const at::Tensor& packed,
+    int64_t numel,
+    const at::Tensor& scale,
+    c10::Device device,
+    at::ScalarType out_dtype,
+    int bitwidth) {
+    if (bitwidth >= 8) {
+        auto half_view = packed.contiguous().view(at::kHalf).view({numel});
+        return half_view.to(device, out_dtype);
+    }
+
+    const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
+    const int mask = (1 << bitwidth) - 1;
+    const int per_byte = 8 / bitwidth;
+
+    auto packed_i = packed.contiguous().view(-1).to(at::kInt);
+    auto shifts = at::arange(0, per_byte, packed_i.options()) * bitwidth;
+    auto expanded = at::bitwise_and(
+        at::bitwise_right_shift(packed_i.unsqueeze(1), shifts),
+        mask).reshape(-1);
+    auto q = expanded.slice(0, 0, numel).to(at::kFloat) + static_cast<float>(qmin);
+
+    if (numel == 0) {
+        return q.to(device, out_dtype);
+    }
+
+    const int64_t block_size = options_.block_size;
+    const int64_t num_blocks = scale.numel();
+    const int64_t expected_blocks = (numel + block_size - 1) / block_size;
+    TORCH_CHECK(
+        num_blocks == expected_blocks,
+        "scale blocks mismatch: got ", num_blocks, " expected ", expected_blocks);
+
+    const int64_t padded = num_blocks * block_size;
+    if (padded != numel) {
+        auto zeros = at::zeros({padded - numel}, q.options());
+        q = at::cat({q, zeros}, 0);
+    }
+
+    auto q_blocks = q.view({num_blocks, block_size});
+    auto scale_f = scale.to(at::kFloat).view({num_blocks, 1});
+    auto out = (q_blocks * scale_f).view({-1}).slice(0, 0, numel).to(device, out_dtype);
+    return out;
+}
+
+bool ProcessGroupLowBit::shouldUseSparseAllreduce(
+    const c10d::AllreduceOptions& opts) const {
+    // 稀疏化路径的激活条件：sparse_enabled 且 op 为 SUM 且 world_size > 1
+    return options_.sparse_enabled &&
+        opts.reduceOp == c10d::ReduceOp::SUM &&
+        getSize() > 1;
+}
+
+at::Tensor ProcessGroupLowBit::quantizedAllreduceTensor(
+    const at::Tensor& flat_input, int bitwidth) {
+    // 对一个 flat float tensor 执行量化 allreduce（SUM 语义）。
+    // 使用指定的 bitwidth 进行 pack/unpack。
+    auto flat = flat_input.contiguous().view(-1).to(at::kFloat);
+    int64_t original_numel = flat.numel();
+    const int world_size = getSize();
+
+    if (original_numel == 0) {
+        return flat;
+    }
+
+    // 补齐到 world_size 的整数倍
+    int64_t pad = (world_size - (original_numel % world_size)) % world_size;
+    if (pad > 0) {
+        flat = at::cat({flat, at::zeros({pad}, flat.options())}, 0);
+    }
+
+    int64_t shard_len = flat.numel() / world_size;
+    auto shards = flat.split(shard_len);
+
+    // ---- 量化打包每个 shard ----
+    std::vector<at::Tensor> send_packed, send_scales;
+    std::vector<at::Tensor> recv_packed, recv_scales;
+    send_packed.reserve(world_size);
+    send_scales.reserve(world_size);
+    recv_packed.reserve(world_size);
+    recv_scales.reserve(world_size);
+
+    for (const auto& shard : shards) {
+        at::Tensor packed, scale;
+        std::tie(packed, scale) = pack(shard, bitwidth);
+        send_packed.push_back(packed);
+        send_scales.push_back(scale);
+        recv_packed.push_back(at::empty_like(packed));
+        recv_scales.push_back(at::empty_like(scale));
+    }
+
+    // ---- Phase 1: AlltoAll 交换打包数据和 scales ----
+    c10d::AllToAllOptions alltoall_opts;
+    auto packed_work = nccl_pg_->alltoall(recv_packed, send_packed, alltoall_opts);
+    auto scales_work = nccl_pg_->alltoall(recv_scales, send_scales, alltoall_opts);
+    packed_work->wait();
+    scales_work->wait();
+
+    // ---- Phase 2: Unpack → Sum（本地 reduce）→ Repack ----
+    auto local_sum = at::zeros({shard_len}, flat.options().dtype(at::kFloat));
+    for (int src = 0; src < world_size; ++src) {
+        auto fp = unpack(
+            recv_packed[src],
+            shard_len,
+            recv_scales[src],
+            flat.device(),
+            at::kFloat,
+            bitwidth);
+        local_sum.add_(fp);
+    }
+
+    at::Tensor reduced_packed, reduced_scale;
+    std::tie(reduced_packed, reduced_scale) = pack(local_sum, bitwidth);
+
+    // ---- Phase 3: Allgather 分发 reduced 数据 ----
+    c10d::AllgatherOptions allgather_opts;
+
+    std::vector<std::vector<at::Tensor>> gathered_packed(1);
+    gathered_packed[0].reserve(world_size);
+    for (int i = 0; i < world_size; ++i) {
+        gathered_packed[0].push_back(at::empty_like(reduced_packed));
+    }
+    std::vector<at::Tensor> packed_input = {reduced_packed};
+    auto gather_packed_work = nccl_pg_->allgather(
+        gathered_packed, packed_input, allgather_opts);
+
+    std::vector<std::vector<at::Tensor>> gathered_scales(1);
+    gathered_scales[0].reserve(world_size);
+    for (int i = 0; i < world_size; ++i) {
+        gathered_scales[0].push_back(at::empty_like(reduced_scale));
+    }
+    std::vector<at::Tensor> scale_input = {reduced_scale};
+    auto gather_scales_work = nccl_pg_->allgather(
+        gathered_scales, scale_input, allgather_opts);
+    gather_packed_work->wait();
+    gather_scales_work->wait();
+
+    // ---- Phase 4: Unpack gathered → 拼接还原 ----
+    std::vector<at::Tensor> out_shards;
+    out_shards.reserve(world_size);
+    for (int r = 0; r < world_size; ++r) {
+        auto fp = unpack(
+            gathered_packed[0][r],
+            shard_len,
+            gathered_scales[0][r],
+            flat.device(),
+            at::kFloat,
+            bitwidth);
+        out_shards.push_back(fp);
+    }
+
+    auto result = at::cat(out_shards, 0).slice(0, 0, original_numel);
+    return result;
+}
+
+void ProcessGroupLowBit::sparseAllreduceTensor(at::Tensor& tensor) {
+    // 对单个 tensor 执行 ARC-Top-K 稀疏化 allreduce（含 Stage-1 Error Feedback）。
+
+    auto flat = tensor.contiguous().view(-1);
+    int64_t d = flat.numel();
+    if (d == 0) return;
+
+    // ---- 0. Error Feedback Stage 1：补偿历史量化/稀疏化残差 ----
+    const bool stage1_ef = useStage1ErrorFeedback();
+    int64_t tensor_id = 0;
+    at::Tensor compensated_flat;
+    if (stage1_ef) {
+        tensor_id = static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(tensor.unsafeGetTensorImpl()));
+        at::Tensor residual;
+        {
+            std::lock_guard<std::mutex> lock(residual_mutex_);
+            auto it = residual_cache_.find(tensor_id);
+            if (it != residual_cache_.end()) {
+                residual = it->second;
+            }
+        }
+        // 残差不存在或形状不匹配时初始化为零
+        if (!residual.defined() ||
+            residual.numel() != d ||
+            residual.device() != flat.device() ||
+            residual.scalar_type() != at::kFloat) {
+            residual = at::zeros({d}, flat.options().dtype(at::kFloat));
+        }
+        compensated_flat = flat.to(at::kFloat) + residual;
+    } else {
+        compensated_flat = flat.to(at::kFloat);
+    }
+
+    // ---- 1. 计算矩阵维度 ----
+    int64_t n = calMaxFactor(d);   // n × m = d, n 为 2 的幂
+    int64_t m = d / n;
+    auto G = compensated_flat.view({n, m});  // 已是 float
+
+    // ---- 2. 随机投影计算各 rank 本地 priority ----
+    //     G: n×m, V: m×r → P: n×r
+    int r = options_.sparse_projection_rank;
+    auto V = at::randn({m, r}, G.options());
+    auto P = at::matmul(G, V) / std::sqrt(static_cast<float>(r));
+
+    // ---- 3. Allreduce P 得到全局 priority ----
+    std::vector<at::Tensor> p_vec = {P};
+    auto p_work = nccl_pg_->allreduce(p_vec);
+    p_work->wait();
+    P = p_vec[0] / static_cast<float>(getSize());     // n×r, 取平均
+
+    // ---- 4. 计算 priority score → Top-K ----
+    //     score[i] = ||P_i||², 即行向量平方 L2 范数
+    auto score = at::sum(P * P, 1);                    // shape [n]
+    int64_t K = std::max(
+        int64_t(1),
+        static_cast<int64_t>(static_cast<float>(n) * options_.sparse_compression_ratio));
+    auto topk_result = at::topk(score, K);              // topk 默认 dim=-1, largest=true
+    auto priority_indices = std::get<1>(topk_result);   // shape [K], int64
+
+    // ---- 5. 互补索引（non-priority 行）----
+    auto all_idx = at::arange(n, priority_indices.options());
+    auto mask = at::zeros({n}, at::TensorOptions().dtype(at::kBool).device(tensor.device()));
+    mask.index_put_({priority_indices}, true);
+    auto non_priority_indices = all_idx.masked_select(mask.logical_not());  // shape [n-K]
+
+    // ---- 6. 按索引提取行 ----
+    auto priority_rows = G.index_select(0, priority_indices);           // K×m
+    auto non_priority_rows = G.index_select(0, non_priority_indices);   // (n-K)×m
+
+    at::Tensor reduced_priority;
+    at::Tensor reduced_non_priority;
+
+    const auto pri_mode = options_.sparse_priority_mode;
+    const auto nonpri_mode = options_.sparse_non_priority_mode;
+
+    // ---- 7. priority 行通信 ----
+    if (pri_mode == SparseCommMode::kFull) {
+        auto pri_flat = priority_rows.contiguous().view(-1);
+        std::vector<at::Tensor> pri_vec = {pri_flat};
+        auto work = nccl_pg_->allreduce(pri_vec);
+        work->wait();
+        reduced_priority = pri_vec[0].view({K, m});
+    } else if (pri_mode == SparseCommMode::kQuantize) {
+        auto pri_flat = priority_rows.contiguous().view(-1);
+        auto reduced_flat = quantizedAllreduceTensor(
+            pri_flat, options_.sparse_priority_quantize_bitwidth);
+        reduced_priority = reduced_flat.view({K, m});
+    } else {
+        reduced_priority = at::zeros_like(priority_rows);  // kDiscard
+    }
+
+    // ---- 8. non-priority 行通信 ----
+    int64_t nonK = n - K;
+    if (nonK > 0) {
+        if (nonpri_mode == SparseCommMode::kFull) {
+            auto nonpri_flat = non_priority_rows.contiguous().view(-1);
+            std::vector<at::Tensor> nonpri_vec = {nonpri_flat};
+            auto work = nccl_pg_->allreduce(nonpri_vec);
+            work->wait();
+            reduced_non_priority = nonpri_vec[0].view({nonK, m});
+        } else if (nonpri_mode == SparseCommMode::kQuantize) {
+            auto nonpri_flat = non_priority_rows.contiguous().view(-1);
+            auto reduced_flat = quantizedAllreduceTensor(
+                nonpri_flat, options_.sparse_non_priority_quantize_bitwidth);
+            reduced_non_priority = reduced_flat.view({nonK, m});
+        } else {
+            reduced_non_priority = at::zeros_like(non_priority_rows);  // kDiscard
+        }
+    } else {
+        reduced_non_priority = at::zeros({0, m}, G.options());
+    }
+
+    // ---- 9. 合并还原到 n×m ----
+    auto result = at::zeros({n, m}, G.options());
+    result.index_put_({priority_indices}, reduced_priority);
+    if (nonK > 0) {
+        result.index_put_({non_priority_indices}, reduced_non_priority);
+    }
+
+    // ---- 10. Error Feedback: 计算本轮残差（补偿后输入 − 近似输出）----
+    if (stage1_ef) {
+        auto result_1d = result.view({d});              // float view
+        auto new_residual = (compensated_flat - result_1d).contiguous();
+        {
+            std::lock_guard<std::mutex> lock(residual_mutex_);
+            residual_cache_[tensor_id] = new_residual;
+        }
+    }
+
+    tensor.copy_(result.view({d}).to(tensor.scalar_type()).view_as(tensor));
+}
+
+c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduceSparse(
+    std::vector<at::Tensor>& tensors,
+    const c10d::AllreduceOptions& opts) {
+    // 稀疏化 allreduce 入口：对每个 tensor 同步执行 ARC-Top-K 稀疏化通信。
+    // 当前为同步实现，返回一个标记为已完成的 WorkBitscom。
+    (void)opts;
+
+    lowbitBackendTiming(
+        this, getRank(),
+        "allreduceSparse enter tensors=" + std::to_string(tensors.size()) +
+            " projection_rank=" + std::to_string(options_.sparse_projection_rank) +
+            " compression_ratio=" + std::to_string(options_.sparse_compression_ratio) +
+            " priority_mode=" + std::to_string(static_cast<int>(options_.sparse_priority_mode)) +
+            " priority_qbw=" + std::to_string(options_.sparse_priority_quantize_bitwidth) +
+            " non_priority_mode=" + std::to_string(static_cast<int>(options_.sparse_non_priority_mode)) +
+            " non_priority_qbw=" + std::to_string(options_.sparse_non_priority_quantize_bitwidth));
+
+    try {
+        for (auto& tensor : tensors) {
+            sparseAllreduceTensor(tensor);
+        }
+        auto work = c10::make_intrusive<WorkBitscom>();
+        work->markCompleted(true);
+        return work;
+    } catch (const std::exception& e) {
+        lowbitBackendTiming(
+            this, getRank(),
+            std::string("allreduceSparse failed exception=") + e.what());
+        auto work = c10::make_intrusive<WorkBitscom>();
+        work->markFailed(std::current_exception());
+        return work;
+    } catch (...) {
+        lowbitBackendTiming(this, getRank(), "allreduceSparse failed unknown exception");
+        auto work = c10::make_intrusive<WorkBitscom>();
+        work->markFailed(std::current_exception());
+        return work;
+    }
+}
+
 // ---- 工厂函数 ----
 
 c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
@@ -1812,7 +2220,14 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     bool error_feedback,
     const std::string& error_feedback_mode,
     int block_size,
-    bool stage2_error_feedback) {
+    bool stage2_error_feedback,
+    bool sparse_enabled,
+    int sparse_projection_rank,
+    float sparse_compression_ratio,
+    int sparse_priority_mode,
+    int sparse_priority_quantize_bitwidth,
+    int sparse_non_priority_mode,
+    int sparse_non_priority_quantize_bitwidth) {
 
     LowBitOptions opts;
     opts.timeout = timeout;
@@ -1821,6 +2236,13 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     opts.error_feedback_mode = error_feedback_mode;
     opts.block_size = block_size;
     opts.stage2_error_feedback = stage2_error_feedback;
+    opts.sparse_enabled = sparse_enabled;
+    opts.sparse_projection_rank = sparse_projection_rank;
+    opts.sparse_compression_ratio = sparse_compression_ratio;
+    opts.sparse_priority_mode = static_cast<SparseCommMode>(sparse_priority_mode);
+    opts.sparse_priority_quantize_bitwidth = sparse_priority_quantize_bitwidth;
+    opts.sparse_non_priority_mode = static_cast<SparseCommMode>(sparse_non_priority_mode);
+    opts.sparse_non_priority_quantize_bitwidth = sparse_non_priority_quantize_bitwidth;
     return c10::make_intrusive<ProcessGroupLowBit>(
         store, rank, size, std::move(opts));
 }

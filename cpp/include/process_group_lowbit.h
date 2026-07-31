@@ -41,6 +41,15 @@ struct LowBitOptions {
     int block_size = 256;
     bool stage2_error_feedback = true;
     std::chrono::milliseconds timeout = std::chrono::milliseconds(600000);
+
+    // ---- sparse ARC-Top-K options ----
+    bool sparse_enabled = false;
+    int sparse_projection_rank = 4;
+    float sparse_compression_ratio = 0.1f;
+    SparseCommMode sparse_priority_mode = SparseCommMode::kFull;
+    int sparse_priority_quantize_bitwidth = 4;          // priority 行量化位宽（mode==kQuantize 时生效）
+    SparseCommMode sparse_non_priority_mode = SparseCommMode::kQuantize;
+    int sparse_non_priority_quantize_bitwidth = 4;      // non-priority 行量化位宽
 };
 
 enum class ErrorFeedbackMode {
@@ -48,6 +57,13 @@ enum class ErrorFeedbackMode {
     kLegacy = 1,
     kEF21 = 2,
     kEF21Plus = 3,
+};
+
+// 稀疏化通信模式：控制 priority / non-priority 行的通信方式
+enum class SparseCommMode {
+    kFull = 0,     // 全精度 NCCL allreduce
+    kQuantize = 1, // 量化通信（位宽由对应的 quantize_bitwidth 决定）
+    kDiscard = 2,  // 舍弃，直接置零
 };
 
 // Work wrapper: 包装底层 NCCL Work，后续可加 unpack 回调
@@ -168,9 +184,11 @@ private:
 
     ErrorFeedbackMode error_feedback_mode_ = ErrorFeedbackMode::kDisabled;
 
-    // ---- pack/unpack 占位 ----
+    // ---- pack/unpack ----
     // 将 float tensor 量化 + 打包为 uint8 buffer，返回 (packed, scale)
     std::tuple<at::Tensor, at::Tensor> pack(const at::Tensor& input);
+    // 重载：显式指定量化位宽（稀疏化路径用）
+    std::tuple<at::Tensor, at::Tensor> pack(const at::Tensor& input, int bitwidth);
     // 将 uint8 buffer 解包 + 反量化为 float tensor
     at::Tensor unpack(
         const at::Tensor& packed,
@@ -178,6 +196,14 @@ private:
         const at::Tensor& scale,
         c10::Device device,
         at::ScalarType out_dtype);
+    // 重载：显式指定位宽
+    at::Tensor unpack(
+        const at::Tensor& packed,
+        int64_t numel,
+        const at::Tensor& scale,
+        c10::Device device,
+        at::ScalarType out_dtype,
+        int bitwidth);
 
     bool shouldUseLowBitAllreduce(const c10d::AllreduceOptions& opts) const;
     c10::intrusive_ptr<c10d::Work> allreduceLowBit(
@@ -212,6 +238,14 @@ private:
     c10::cuda::CUDAStream getLauncherStream(int device_index);
     c10::cuda::CUDAStream getLowBitStream(int device_index, int slot);
     void initLowBitComm();
+
+    // ---- sparse ARC-Top-K allreduce ----
+    bool shouldUseSparseAllreduce(const c10d::AllreduceOptions& opts) const;
+    c10::intrusive_ptr<c10d::Work> allreduceSparse(
+        std::vector<at::Tensor>& tensors,
+        const c10d::AllreduceOptions& opts);
+    void sparseAllreduceTensor(at::Tensor& tensor);
+    at::Tensor quantizedAllreduceTensor(const at::Tensor& flat, int bitwidth);
 
     bool useStage1ErrorFeedback() const;
     bool useStage2ErrorFeedback() const;
@@ -260,6 +294,13 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     bool error_feedback,
     const std::string& error_feedback_mode,
     int block_size,
-    bool stage2_error_feedback);
+    bool stage2_error_feedback,
+    bool sparse_enabled,
+    int sparse_projection_rank,
+    float sparse_compression_ratio,
+    int sparse_priority_mode,
+    int sparse_priority_quantize_bitwidth,
+    int sparse_non_priority_mode,
+    int sparse_non_priority_quantize_bitwidth);
 
 }  // namespace bitscom
