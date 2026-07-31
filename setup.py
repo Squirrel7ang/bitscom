@@ -134,6 +134,19 @@ def _torch_lib_dir():
 def _collect_library_dirs():
     lib_dirs = [_torch_lib_dir()]
 
+    # Probe CUDA / CoreX SDK library paths (same logic as include dirs).
+    cuda_home = os.environ.get("CUDA_HOME")
+    if not cuda_home and os.path.isdir("/usr/local/corex-4.4.0"):
+        cuda_home = "/usr/local/corex-4.4.0"
+    if not cuda_home:
+        cuda_home = "/usr/local/cuda"
+    sys_cuda_lib_candidates = [
+        os.path.join(cuda_home, "lib64"),
+        os.path.join(cuda_home, "lib"),
+        os.path.join(cuda_home, "targets", "x86_64-linux", "lib"),
+    ]
+    lib_dirs.extend([p for p in sys_cuda_lib_candidates if _existing(p)])
+
     env_lib = os.environ.get("NCCL_LIB_DIR")
     if env_lib and _existing(env_lib):
         lib_dirs.append(env_lib)
