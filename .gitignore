@@ -9,3 +9,4 @@
 /.cache/
 # Ignore the Bazel module files.
 /MODULE.bazel*
+**/__pycache__

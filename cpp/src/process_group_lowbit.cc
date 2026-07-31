@@ -123,12 +123,16 @@ ncclDataType_t ncclDataTypeFor(const at::Tensor& tensor) {
     }
 }
 
-// 找到 size 的最大 2 的幂因子，用于将 1D tensor reshape 为 n×m 矩阵
-// 要求 factor 整除 size 且 size/factor > factor（保证矩阵不太扁）
+// 找到 size 的最大 2 的幂因子 n，使得 n*m = size
+// 其目标是找到最接近 sqrt(size) 的 2 的幂因子，同时保证整除
 int64_t calMaxFactor(int64_t size) {
     int64_t factor = 1;
     while (size % factor == 0 && size / factor > factor) {
         factor *= 2;
+    }
+    // 回退到能整除 size 的最大因子（处理 size=100 等非 2 的幂整数倍）
+    while (factor > 1 && size % factor != 0) {
+        factor /= 2;
     }
     return factor;
 }

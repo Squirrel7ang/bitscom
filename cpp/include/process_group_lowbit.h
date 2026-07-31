@@ -34,6 +34,13 @@ struct LowBitScheduledHandle {
     std::shared_ptr<LowBitAllreduceTask> task;
 };
 
+// 稀疏化通信模式：控制 priority / non-priority 行的通信方式
+enum class SparseCommMode {
+    kFull = 0,     // 全精度 NCCL allreduce
+    kQuantize = 1, // 量化通信（位宽由对应的 quantize_bitwidth 决定）
+    kDiscard = 2,  // 舍弃，直接置零
+};
+
 struct LowBitOptions {
     int bitwidth = 4;
     bool error_feedback = false;
@@ -57,13 +64,6 @@ enum class ErrorFeedbackMode {
     kLegacy = 1,
     kEF21 = 2,
     kEF21Plus = 3,
-};
-
-// 稀疏化通信模式：控制 priority / non-priority 行的通信方式
-enum class SparseCommMode {
-    kFull = 0,     // 全精度 NCCL allreduce
-    kQuantize = 1, // 量化通信（位宽由对应的 quantize_bitwidth 决定）
-    kDiscard = 2,  // 舍弃，直接置零
 };
 
 // Work wrapper: 包装底层 NCCL Work，后续可加 unpack 回调
