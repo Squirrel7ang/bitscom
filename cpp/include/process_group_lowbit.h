@@ -247,6 +247,18 @@ private:
     void sparseAllreduceTensor(at::Tensor& tensor);
     at::Tensor quantizedAllreduceTensor(const at::Tensor& flat, int bitwidth);
 
+    // ---- sparse ARC-Top-K reduce_scatter ----
+    bool shouldUseSparseReduceScatter(const c10d::ReduceScatterOptions& opts) const;
+    c10::intrusive_ptr<c10d::Work> reduceScatterSparse(
+        std::vector<at::Tensor>& output_tensors,
+        std::vector<std::vector<at::Tensor>>& input_tensors,
+        const c10d::ReduceScatterOptions& opts);
+    // 对一组 sub-tensor 执行 pack→alltoall→unpack→sum 的量化 reduce_scatter
+    // inputs: world_size 个 flat tensor（每个 rank 贡献的数据）
+    // 返回该 rank 分到的 reduced 结果
+    at::Tensor quantizedReduceScatterPart(
+        const std::vector<at::Tensor>& inputs, int bitwidth);
+
     bool useStage1ErrorFeedback() const;
     bool useStage2ErrorFeedback() const;
 
