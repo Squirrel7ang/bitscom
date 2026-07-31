@@ -379,6 +379,166 @@ class TestSparseLowbitHandcrafted:
 # 随机例子测试 — 比较稀疏化结果与全精度 allreduce
 # ============================================================
 
+class TestHandcrafted8x8FullDiscard:
+    """8×8 手搓矩阵，priority=full, non_priority=discard，两 rank all_reduce。
+
+    运行方式:
+        pytest tests/test_sparse_lowbit.py::TestHandcrafted8x8FullDiscard -v -s
+    """
+
+    def test_8x8_priority_full_nonpriority_discard(self):
+        """
+        一个 8×8=64 元素的矩阵，两节点 allreduce。
+        行 0 和行 3 设为大值（~100 和 ~-50 量级），其余行设为小值。
+        ratio=0.25 → K=2，预期选中行 0 和行 3。
+        配置: priority_mode=full (全精度), non_priority_mode=discard (舍弃→置零)。
+        """
+        d = 64
+        n = _cal_max_factor(d)  # 8
+        m = d // n               # 8
+        assert n == 8 and m == 8, f"Expected 8×8, got {n}×{m}"
+
+        # ========================================
+        # 手搓 rank 0 的矩阵 (按行排列, 8×8)
+        # ========================================
+        rank0_data = [
+            # row 0: 大正值 (~100-107) → 明显是 priority 行
+            [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0],
+            # row 1: 小值
+            [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
+            # row 2: 正负交替
+            [1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0],
+            # row 3: 大负值 (~-50 → -57) → 明显是 priority 行
+            [-50.0, -51.0, -52.0, -53.0, -54.0, -55.0, -56.0, -57.0],
+            # row 4: 小幅递增
+            [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5],
+            # row 5: 微小值
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+            # row 6: ±交替小值
+            [-0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5],
+            # row 7: 小幅递增
+            [1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2],
+        ]
+        rank0 = torch.tensor([v for row in rank0_data for v in row], dtype=torch.float32)
+
+        # ========================================
+        # 手搓 rank 1 的矩阵
+        # ========================================
+        rank1_data = [
+            # row 0: 大正值 (~200-207), 与 rank0 同号、不同值
+            [200.0, 201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0],
+            # row 1: 稍微不同的值
+            [1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2],
+            # row 2: 与 rank0 相反符号
+            [-1.0, 1.0, -2.0, 2.0, -3.0, 3.0, -4.0, 4.0],
+            # row 3: 大负值 (~-70 → -77)
+            [-70.0, -71.0, -72.0, -73.0, -74.0, -75.0, -76.0, -77.0],
+            # row 4: 小幅递增
+            [3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5],
+            # row 5: 微小值
+            [1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8],
+            # row 6: ±交替小值, 与 rank0 相反
+            [0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5],
+            # row 7: 小幅递增
+            [2.5, 2.6, 2.7, 2.8, 2.9, 3.0, 3.1, 3.2],
+        ]
+        rank1 = torch.tensor([v for row in rank1_data for v in row], dtype=torch.float32)
+
+        # ========================================
+        # 打印输入
+        # ========================================
+        print("\n" + "=" * 70)
+        print("ARC-Top-K Sparse AllReduce — 8×8 Handcrafted Test")
+        print("  config: priority_mode=full, non_priority_mode=discard")
+        print("  projection_rank=4, compression_ratio=0.25 (K=2)")
+        print("=" * 70)
+
+        G0 = rank0.view(8, 8)
+        G1 = rank1.view(8, 8)
+        print(f"\nRank 0 matrix G0 (8×8):\n{G0}")
+        print(f"\nRank 1 matrix G1 (8×8):\n{G1}")
+
+        # ========================================
+        # 真实 allreduce SUM
+        # ========================================
+        true_sum = rank0 + rank1
+        G_true = true_sum.view(8, 8)
+        print(f"\nTrue AllReduce SUM (8×8):\n{G_true}")
+
+        # ========================================
+        # sparse allreduce 模拟
+        # ========================================
+        result = _sparse_allreduce_sim(
+            [rank0, rank1],
+            compression_ratio=0.25,
+            projection_rank=4,
+            priority_mode="full",
+            priority_bitwidth=4,
+            non_priority_mode="discard",
+            non_priority_bitwidth=4,
+            verbose=True,
+        )
+
+        # ========================================
+        # 验证 & 打印结果
+        # ========================================
+        # 找出 priority 行索引 (与 _sparse_allreduce_sim 相同的计算)
+        Gs = [rank0.view(8, 8).to(torch.float32), rank1.view(8, 8).to(torch.float32)]
+        r = 4
+        V = torch.randn(8, r, dtype=torch.float32)
+        Ps = [torch.matmul(G, V) / math.sqrt(float(r)) for G in Gs]
+        P_global = sum(Ps) / 2.0
+        score = (P_global * P_global).sum(dim=1)
+        K = max(1, int(8 * 0.25))
+        _, priority_indices = torch.topk(score, K)
+        comp_indices = torch.arange(8)[
+            ~torch.isin(torch.arange(8), priority_indices)
+        ]
+
+        print(f"\n{'=' * 70}")
+        print(f"Priority score per row: {score.tolist()}")
+        print(f"Priority row indices (K={K}): {priority_indices.tolist()}")
+        print(f"Non-priority row indices:     {comp_indices.tolist()}")
+        print(f"{'=' * 70}")
+
+        for rank_idx, r_tensor in enumerate(result):
+            G_result = r_tensor.view(8, 8)
+            print(f"\nSparse AllReduce result (rank {rank_idx}):\n{G_result}")
+
+            # ---- 验证 ----
+            # Priority 行应该等于 true sum (全精度, 误差为 0)
+            pri_err = (G_result[priority_indices] - G_true[priority_indices]).abs().max().item()
+            print(f"  Priority rows max error: {pri_err:.10f}")
+            assert pri_err < 1e-6, f"Priority rows should be exact! got err={pri_err}"
+
+            # Non-priority 行应该全为 0 (discard)
+            nonpri_max = G_result[comp_indices].abs().max().item()
+            print(f"  Non-priority rows max abs: {nonpri_max:.10f}")
+            assert nonpri_max < 1e-6, f"Non-priority rows should be zero! got {nonpri_max}"
+
+            # 根据预期手算值验证 priority 行
+            # Row 0: rank0+rank1 = [100+200, 101+201, ...] = [300, 302, ..., 314]
+            expected_row0 = torch.tensor(
+                [300.0, 302.0, 304.0, 306.0, 308.0, 310.0, 312.0, 314.0]
+            )
+            # Row 3: rank0+rank1 = [-50-70, -51-71, ...] = [-120, -122, ..., -134]
+            expected_row3 = torch.tensor(
+                [-120.0, -122.0, -124.0, -126.0, -128.0, -130.0, -132.0, -134.0]
+            )
+            for pi, expected_row in zip(priority_indices.tolist(), [expected_row0, expected_row3]):
+                row_err = (G_result[pi] - expected_row).abs().max().item()
+                print(f"  Row {pi} vs expected: max_err={row_err:.10f}")
+                assert row_err < 1e-6, f"Row {pi} mismatch! expected={expected_row.tolist()}"
+
+        print(f"\n{'=' * 70}")
+        print("✓ All checks passed")
+        print(f"{'=' * 70}")
+
+
+# ============================================================
+# 随机例子测试 — 比较稀疏化结果与全精度 allreduce
+# ============================================================
+
 class TestSparseLowbitRandom:
     """随机生成数据，验证稀疏化量化结果与全精度 allreduce 的接近程度。"""
 
