@@ -9,15 +9,21 @@
 /.cache/
 # Ignore the Bazel module files.
 /MODULE.bazel*
+
+# Python bytecode caches
+__pycache__/
 **/__pycache__
-# Compiled C++ extensions — platform/Python-version specific, built via pip install -e .
-python/bitscom/_lowbit_c*.so
-python/bitscom/_lowbit_cuda*.so
-# Editable install egg-link
-bitscom.egg-info/
-# Build artifacts
+*.pyc
+
+# pytest cache
+.pytest_cache/
+
+# Python packaging / build artifacts
 build/
 dist/
 *.egg-info/
 
-*linux-gnu.so
+# Compiled C++ extensions and object files (platform/Python-version specific)
+*.so
+*.o
+*.a
