@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -2102,7 +2103,8 @@ void ProcessGroupLowBit::sparseAllreduceTensor(at::Tensor& tensor) {
     auto score = at::sum(P * P, 1);                    // shape [n]
     int64_t K = std::max(
         int64_t(1),
-        static_cast<int64_t>(static_cast<float>(n) * options_.sparse_compression_ratio));
+        static_cast<int64_t>(std::llround(
+            static_cast<double>(n) * options_.sparse_compression_ratio)));
     auto topk_result = at::topk(score, K);              // topk 默认 dim=-1, largest=true
     auto priority_indices = std::get<1>(topk_result);   // shape [K], int64
 
@@ -2227,6 +2229,7 @@ bool ProcessGroupLowBit::shouldUseSparseReduceScatter(
         getSize() > 1;
 }
 
+// Reduce Scatter 量化核心代码
 at::Tensor ProcessGroupLowBit::quantizedReduceScatterPart(
     const std::vector<at::Tensor>& inputs, int bitwidth) {
     // 对 inputs（world_size 个等长 flat tensor）执行 pack→alltoall→unpack→sum
@@ -2289,8 +2292,13 @@ at::Tensor ProcessGroupLowBit::quantizedReduceScatterPart(
         at::TensorOptions().dtype(at::kFloat).device(inputs[0].device()));
     for (int src = 0; src < world_size; ++src) {
         auto fp = unpack(
-            recv_packed[src], shard_len, recv_scales[src],
-            inputs[0].device(), at::kFloat, bitwidth);
+            recv_packed[src],
+            shard_len,
+            recv_scales[src],
+            inputs[0].device(),
+            at::kFloat,
+            bitwidth
+        );
         local_sum.add_(fp);
     }
 
@@ -2318,36 +2326,35 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
         for (size_t idx = 0; idx < output_tensors.size(); ++idx) {
             auto& output = output_tensors[idx];
             auto& inputs = input_tensors[idx];
-            int64_t numel = output.numel();
+            // 标准 reduce_scatter 约定：input_tensors[idx] 是本 rank 的 world_size 个
+            // 等长 chunk，全部拼接起来才是本 rank 的完整输入张量
+            // （N = world_size * output.numel()）。
+            TORCH_CHECK(
+                inputs.size() == static_cast<size_t>(world_size),
+                "reduceScatterSparse expects input_tensors[", idx, "] size == world_size, got ",
+                inputs.size(), " vs ", world_size);
 
-            // ====== ARC-Top-K ======
-            int64_t n = calMaxFactor(numel);
-            int64_t m = numel / n;
-            auto G_local = inputs[rank].contiguous().view({n, m}).to(at::kFloat);
+            int64_t shard_len = output.numel();           // 本 rank 拿到的部分
+            int64_t full_numel = shard_len * world_size;  // 完整张量元素数
+            if (full_numel == 0) {
+                continue;
+            }
 
-            int r = options_.sparse_projection_rank;
-            auto V = at::randn({m, r}, G_local.options());
-            auto P_local = at::matmul(G_local, V) / std::sqrt(static_cast<float>(r));
+            std::vector<at::Tensor> flat_chunks;
+            flat_chunks.reserve(world_size);
+            for (int j = 0; j < world_size; ++j) {
+                TORCH_CHECK(
+                    inputs[j].numel() == shard_len,
+                    "reduceScatterSparse expects equal chunk sizes at index ", idx,
+                    ": chunk=", inputs[j].numel(), " output=", shard_len);
+                flat_chunks.push_back(inputs[j].contiguous().view(-1));
+            }
+            // 拼接成本 rank 的完整输入（float，EF 补偿与 allreduce 都基于它）
+            auto full_flat = at::cat(flat_chunks, 0).to(at::kFloat);
 
-            std::vector<at::Tensor> p_vec = {P_local};
-            nccl_pg_->allreduce(p_vec)->wait();
-            auto P_global = p_vec[0] / static_cast<float>(world_size);
-
-            auto score = at::sum(P_global * P_global, 1);
-            int64_t K = std::max(int64_t(1),
-                static_cast<int64_t>(static_cast<float>(n) * options_.sparse_compression_ratio));
-            auto topk_result = at::topk(score, K);
-            auto priority_indices = std::get<1>(topk_result);
-
-            auto all_idx = at::arange(n, priority_indices.options());
-            auto mask = at::zeros({n}, at::TensorOptions().dtype(at::kBool).device(output.device()));
-            mask.index_put_({priority_indices}, true);
-            auto non_priority_indices = all_idx.masked_select(mask.logical_not());
-            int64_t nonK = n - K;
-
-            // ====== Error Feedback: 读取 + 补偿 ======
+            // ====== Error Feedback: 读取残差 + 补偿本 rank 的 shard ======
+            // 残差按「本 rank 的 output shard」维度存储（numel == shard_len）。
             int64_t tensor_id = 0;
-            at::Tensor compensated;
             if (stage1_ef) {
                 tensor_id = static_cast<int64_t>(
                     reinterpret_cast<uintptr_t>(output.unsafeGetTensorImpl()));
@@ -2357,142 +2364,118 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                     auto it = residual_cache_.find(tensor_id);
                     if (it != residual_cache_.end()) residual = it->second;
                 }
-                if (!residual.defined() || residual.numel() != numel ||
+                if (!residual.defined() || residual.numel() != shard_len ||
                     residual.device() != output.device() ||
                     residual.scalar_type() != at::kFloat) {
-                    residual = at::zeros({numel},
+                    residual = at::zeros({shard_len},
                         at::TensorOptions().dtype(at::kFloat).device(output.device()));
                 }
-                compensated = inputs[rank].contiguous().view(-1).to(at::kFloat) + residual;
+                // AllReduce+Scatter 下每个 rank 只拥有自己的 shard，只补偿这一段
+                full_flat.slice(0, rank * shard_len, (rank + 1) * shard_len).add_(residual);
             }
 
-            // ====== 提取各 rank 的 priority / non-priority 行 ======
-            std::vector<at::Tensor> pri_inputs(world_size);
-            std::vector<at::Tensor> nonpri_inputs(world_size);
-            for (int src = 0; src < world_size; ++src) {
-                auto src_mat = inputs[src].contiguous().view({n, m}).to(at::kFloat);
-                // EF: 用补偿后的数据作为 priority 判断依据（仅 local rank）
-                if (stage1_ef && src == rank) {
-                    src_mat = compensated.view({n, m});
-                }
-                pri_inputs[src] = src_mat.index_select(0, priority_indices)
-                                      .contiguous().view(-1);
-                nonpri_inputs[src] = (nonK > 0)
-                    ? src_mat.index_select(0, non_priority_indices).contiguous().view(-1)
-                    : at::zeros({0}, src_mat.options());
-            }
+            // ====== ARC-Top-K（基于完整张量） ======
+            int64_t n = calMaxFactor(full_numel);
+            int64_t m = full_numel / n;
+            auto G = full_flat.view({n, m});
 
-            // ====== 通信 ======
+            int r = options_.sparse_projection_rank;
+            auto V = at::randn({m, r}, G.options());
+            auto P_local = at::matmul(G, V) / std::sqrt(static_cast<float>(r));
+
+            std::vector<at::Tensor> p_vec = {P_local};
+            nccl_pg_->allreduce(p_vec)->wait();
+            auto P_global = p_vec[0] / static_cast<float>(world_size);
+
+            auto score = at::sum(P_global * P_global, 1);
+            int64_t K = std::max(int64_t(1),
+                static_cast<int64_t>(std::llround(
+                    static_cast<double>(n) * options_.sparse_compression_ratio)));
+            auto topk_result = at::topk(score, K);
+            auto priority_indices = std::get<1>(topk_result);
+
+            auto all_idx = at::arange(n, priority_indices.options());
+            auto mask = at::zeros({n}, at::TensorOptions().dtype(at::kBool).device(output.device()));
+            mask.index_put_({priority_indices}, true);
+            auto non_priority_indices = all_idx.masked_select(mask.logical_not());
+            int64_t nonK = n - K;
+
+            // ====== 提取本 rank 的 priority / non-priority 行 ======
+            auto priority_rows = G.index_select(0, priority_indices);           // K×m
+            auto non_priority_rows = (nonK > 0)
+                ? G.index_select(0, non_priority_indices)
+                : at::zeros({0, m}, G.options());
+
+            // ====== AllReduce（三条路径） ======
             const auto pri_mode = options_.sparse_priority_mode;
             const auto nonpri_mode = options_.sparse_non_priority_mode;
 
-            // priority 行: 归约为 (K*m/world_size) 个元素
-            at::Tensor reduced_pri_flat;
-            if (pri_mode == SparseCommMode::kDiscard || K == 0) {
-                reduced_pri_flat = at::zeros({(K * m) / world_size},
-                    at::TensorOptions().dtype(at::kFloat).device(output.device()));
-            } else if (pri_mode == SparseCommMode::kFull) {
-                // 使用 nccl reduce_scatter 原生全精度
-                auto pri_out = output.view({n, m}).index_select(0, priority_indices)
-                                   .contiguous().view(-1);
-                std::vector<at::Tensor> pri_outs = {pri_out};
-                std::vector<std::vector<at::Tensor>> pri_ins = {pri_inputs};
-                nccl_pg_->reduce_scatter(pri_outs, pri_ins, opts)->wait();
-                reduced_pri_flat = pri_outs[0];
-            } else {  // kQuantize
-                reduced_pri_flat = quantizedReduceScatterPart(
-                    pri_inputs, options_.sparse_priority_quantize_bitwidth);
+            at::Tensor reduced_priority;
+            if (pri_mode == SparseCommMode::kFull) { // Full: nccl 全精度 allreduce
+                auto pri_flat = priority_rows.contiguous().view(-1);
+                std::vector<at::Tensor> pri_vec = {pri_flat};
+                nccl_pg_->allreduce(pri_vec)->wait();
+                reduced_priority = pri_vec[0].view({K, m});
+            } else if (pri_mode == SparseCommMode::kQuantize) { // Quantize: 复用 sparse allreduce
+                auto pri_flat = priority_rows.contiguous().view(-1);
+                sparseAllreduceTensor(pri_flat);
+                // sparseAllreduceTensor 会把临时 tensor 的 EF 残差写进 cache；
+                // 该临时 tensor 下一轮不复用，清掉以免脏 key 碰撞/显存泄漏
+                if (stage1_ef) {
+                    auto temp_id = static_cast<int64_t>(
+                        reinterpret_cast<uintptr_t>(pri_flat.unsafeGetTensorImpl()));
+                    std::lock_guard<std::mutex> lock(residual_mutex_);
+                    residual_cache_.erase(temp_id);
+                }
+                reduced_priority = pri_flat.view({K, m});
+            } else { // Discard: 置零即可，无需通信（各 rank 的 collective 序列一致）
+                reduced_priority = at::zeros_like(priority_rows);
             }
 
-            // non-priority 行
-            at::Tensor reduced_nonpri_flat;
-            if (nonpri_mode == SparseCommMode::kDiscard || nonK == 0) {
-                reduced_nonpri_flat = at::zeros({(nonK * m) / world_size},
-                    at::TensorOptions().dtype(at::kFloat).device(output.device()));
-            } else if (nonpri_mode == SparseCommMode::kFull) {
-                auto nonpri_out = output.view({n, m}).index_select(0, non_priority_indices)
-                                      .contiguous().view(-1);
-                std::vector<at::Tensor> nonpri_outs = {nonpri_out};
-                std::vector<std::vector<at::Tensor>> nonpri_ins = {nonpri_inputs};
-                nccl_pg_->reduce_scatter(nonpri_outs, nonpri_ins, opts)->wait();
-                reduced_nonpri_flat = nonpri_outs[0];
-            } else {
-                reduced_nonpri_flat = quantizedReduceScatterPart(
-                    nonpri_inputs, options_.sparse_non_priority_quantize_bitwidth);
+            at::Tensor reduced_non_priority;
+            if (nonK == 0) {
+                reduced_non_priority = at::zeros({0, m}, G.options());
+            } else if (nonpri_mode == SparseCommMode::kFull) { // Full: nccl 全精度 allreduce
+                auto nonpri_flat = non_priority_rows.contiguous().view(-1);
+                std::vector<at::Tensor> nonpri_vec = {nonpri_flat};
+                nccl_pg_->allreduce(nonpri_vec)->wait();
+                reduced_non_priority = nonpri_vec[0].view({nonK, m});
+            } else if (nonpri_mode == SparseCommMode::kQuantize) { // Quantize: 复用 sparse allreduce
+                auto nonpri_flat = non_priority_rows.contiguous().view(-1);
+                sparseAllreduceTensor(nonpri_flat);
+                if (stage1_ef) {
+                    auto temp_id = static_cast<int64_t>(
+                        reinterpret_cast<uintptr_t>(nonpri_flat.unsafeGetTensorImpl()));
+                    std::lock_guard<std::mutex> lock(residual_mutex_);
+                    residual_cache_.erase(temp_id);
+                }
+                reduced_non_priority = nonpri_flat.view({nonK, m});
+            } else { // Discard: 置零
+                reduced_non_priority = at::zeros_like(non_priority_rows);
             }
 
-            // ====== 重建该 rank 的 output（GPU tensor ops）======
-            int64_t out_numel = numel;  // = n * m
-            int64_t shard_len = out_numel / world_size;
-            int64_t shard_start = rank * shard_len;
-
-            // global_flat 位置 → row, col
-            auto global_idx = at::arange(shard_start, shard_start + shard_len,
-                at::TensorOptions().dtype(at::kLong).device(output.device()));
-            auto rows = global_idx / m;
-            auto cols = global_idx % m;
-
-            // row → priority index (-1 = non-priority)
-            auto row_to_pri = at::full({n}, int64_t(-1),
-                at::TensorOptions().dtype(at::kLong).device(output.device()));
-            row_to_pri.index_put_({priority_indices},
-                at::arange(K, at::TensorOptions().dtype(at::kLong).device(output.device())));
-
-            auto pri_idx_in_set = row_to_pri.index_select(0, rows);  // [shard_len]
-            auto is_pri = pri_idx_in_set >= 0;
-
-            int64_t pri_total = K * m;
-            int64_t nonpri_total = nonK * m;
-
-            auto result_f = at::zeros({shard_len},
-                at::TensorOptions().dtype(at::kFloat).device(output.device()));
-
-            // priority 部分
-            if (K > 0 && pri_mode != SparseCommMode::kDiscard) {
-                auto pri_flat_pos = pri_idx_in_set * m + cols
-                    - rank * (pri_total / world_size);
-                auto pri_src = pri_flat_pos.masked_select(is_pri);
-                auto pri_vals = at::index_select(reduced_pri_flat, 0, pri_src);
-                result_f.masked_scatter_(is_pri, pri_vals);
+            // ====== 拼接恢复成完整张量 → Scatter ======
+            auto reduced_full = at::zeros({n, m}, G.options());
+            reduced_full.index_put_({priority_indices}, reduced_priority);
+            if (nonK > 0) {
+                reduced_full.index_put_({non_priority_indices}, reduced_non_priority);
             }
 
-            // non-priority 部分
-            if (nonK > 0 && nonpri_mode != SparseCommMode::kDiscard) {
-                auto row_to_nonpri = at::full({n}, int64_t(-1),
-                    at::TensorOptions().dtype(at::kLong).device(output.device()));
-                row_to_nonpri.index_put_({non_priority_indices},
-                    at::arange(nonK, at::TensorOptions().dtype(at::kLong).device(output.device())));
-                auto nonpri_idx = row_to_nonpri.index_select(0, rows);
-                auto is_nonpri = nonpri_idx >= 0;
+            // 按连续 chunk 切分：本 rank 拿到 [rank*shard_len, (rank+1)*shard_len)
+            auto my_shard = reduced_full.view({full_numel}).slice(
+                0, rank * shard_len, (rank + 1) * shard_len);
 
-                auto nonpri_flat_pos = nonpri_idx * m + cols
-                    - rank * (nonpri_total / world_size);
-                auto nonpri_src = nonpri_flat_pos.masked_select(is_nonpri);
-                auto nonpri_vals = at::index_select(reduced_nonpri_flat, 0, nonpri_src);
-                // non-priority 部分叠加（与 priority 互斥，不会冲突）
-                auto nonpri_contrib = at::zeros({shard_len},
-                    at::TensorOptions().dtype(at::kFloat).device(output.device()));
-                nonpri_contrib.masked_scatter_(is_nonpri, nonpri_vals);
-                result_f = result_f + nonpri_contrib;
-            }
-
-            // ====== Error Feedback: 保存残差 ======
+            // ====== Error Feedback: 保存残差（补偿后 shard − reduced shard） ======
             if (stage1_ef) {
-                auto local_input_f = inputs[rank].contiguous().view(-1).to(at::kFloat);
-                // result_f 是 rank r 分到的 reduced shard
-                // 残差 = 本地输入(此rank部分) - reduced结果(此rank部分)
-                // 注意：残差形状为 output.numel()（该 rank 拿到的部分）
-                auto local_shard = local_input_f.slice(0,
-                    rank * (numel / world_size),
-                    (rank + 1) * (numel / world_size));
-                auto new_residual = (local_shard - result_f).contiguous();
+                auto local_shard = full_flat.slice(0, rank * shard_len, (rank + 1) * shard_len);
+                auto new_residual = (local_shard - my_shard).contiguous();
                 {
                     std::lock_guard<std::mutex> lock(residual_mutex_);
                     residual_cache_[tensor_id] = new_residual;
                 }
             }
 
-            output.copy_(result_f.to(output.scalar_type()));
+            output.copy_(my_shard.to(output.scalar_type()).view_as(output));
         }
 
         auto work = c10::make_intrusive<WorkBitscom>();
