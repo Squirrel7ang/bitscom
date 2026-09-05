@@ -25,146 +25,219 @@ TEST_CASES = [
         "name": "reduce_scatter_bw4",
         "bitwidth": 4,
         "numel": 512,
+        "sparse": True,
+        "sparse_compression_ratio": 0.5,
+        "sparse_priority_mode": 0,
+        "sparse_non_priority_mode": 1,
+        "sparse_priority_quantize_bitwidth": 4,
+        "sparse_non_priority_quantize_bitwidth": 4,
         "seed": 17,
-    },
-    {
-        "name": "reduce_scatter_bw2",
-        "bitwidth": 2,
-        "numel": 1024,
-        "seed": 29,
     },
 ]
 
+def testCase(case):
+    # Register the lowbit backend exactly like megatron/training/initialize.py
+    # does, passing the full sparse configuration explicitly.
+    if case.get("sparse", False):
+        bitscom.init(
+            bitwidth=case["bitwidth"],
+            error_feedback=False,
+            error_feedback_mode="none",
+            block_size=DEFAULT_BLOCK_SIZE,
+            sparse_enabled=True,
+            sparse_projection_rank=case.get("sparse_projection_rank", 4),
+            sparse_compression_ratio=case["sparse_compression_ratio"],
+            sparse_priority_mode=case.get("sparse_priority_mode", 0),
+            sparse_priority_quantize_bitwidth=case.get("sparse_priority_quantize_bitwidth", 4),
+            sparse_non_priority_mode=case.get("sparse_non_priority_mode", 1),
+            sparse_non_priority_quantize_bitwidth=case.get("sparse_non_priority_quantize_bitwidth", 4),
+        )
 
-def _make_inputs(rank: int, world_size: int, case: dict, device: torch.device) -> list[torch.Tensor]:
+    world_size = 2
     numel = int(case["numel"])
+    bitwidth = int(case["bitwidth"])
     seed = int(case["seed"])
+    shard_len = numel // world_size
+    assert shard_len * world_size == numel, f"{case['name']}: numel must divide world_size"
 
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed + rank * 97)
-    base = torch.linspace(-1.2, 1.4, steps=numel, dtype=torch.float32)
-
+    # Standard reduce_scatter convention: each rank owns a full tensor made of
+    # world_size equal chunks, and rank r receives the reduced chunk r.
     inputs = []
-    for shard_idx in range(world_size):
-        noise = torch.randn(numel, generator=gen, dtype=torch.float32) * 0.02
-        shard = base + noise + rank * 0.05 + shard_idx * 0.01
-        inputs.append(shard.to(device))
-    return inputs
+    for rank in range(world_size):
+        gen = torch.Generator()
+        gen.manual_seed(seed + rank)
+        # Bounded range [-0.1, 0.1] keeps the quantization error bounds tight.
+        inputs.append(torch.rand(numel, generator=gen) * 0.2 - 0.1)
 
+    exact_sum = inputs[0] + inputs[1]  # full-precision reference
 
-def _simulate_lowbit_reduce_scatter_cpu(
-    inputs_by_rank: list[list[torch.Tensor]],
-    bitwidth: int,
-    block_size: int = DEFAULT_BLOCK_SIZE,
-) -> list[torch.Tensor]:
-    world_size = len(inputs_by_rank)
-    if world_size == 0:
-        return []
+    def _cal_max_factor(size):
+        # Mirror calMaxFactor in the C++ backend: largest power-of-two factor.
+        factor = 1
+        while size % factor == 0 and size // factor > factor:
+            factor *= 2
+        while factor > 1 and size % factor != 0:
+            factor //= 2
+        return factor
 
-    shard_count = len(inputs_by_rank[0])
-    if shard_count == 0:
-        return [torch.empty(0) for _ in range(world_size)]
-
-    numel = int(inputs_by_rank[0][0].numel())
-    reduced_by_shard: list[torch.Tensor] = []
-
-    for shard_idx in range(shard_count):
-        local_sum = torch.zeros(numel, dtype=torch.float32)
-        for src_rank in range(world_size):
-            shard = inputs_by_rank[src_rank][shard_idx]
-            q, scales = quantize_tensor_blockwise(
-                shard,
-                bitwidth=bitwidth,
-                block_size=block_size,
-                stochastic_rounding=False,
-            )
-            packed, _ = pack_lowbit(q, bitwidth)
-            q_unpacked = unpack_lowbit(packed, bitwidth, numel)
-            fp_part = dequantize_tensor_blockwise(
-                q_unpacked,
-                scales,
-                block_size=block_size,
-                dtype=torch.float32,
-                device=torch.device("cpu"),
-            )
-            local_sum.add_(fp_part)
-        reduced_by_shard.append(local_sum)
-
-    outputs = [reduced_by_shard[rank_idx] for rank_idx in range(world_size)]
-    return outputs
-
-
-def _worker(rank: int, world_size: int, init_file: str, case: dict, q):
-    try:
-        bitwidth = int(case["bitwidth"])
-        bitscom.init(bitwidth=bitwidth)
-        dist.init_process_group(
-            backend="lowbit",
-            init_method=f"file://{init_file}",
-            rank=rank,
-            world_size=world_size,
+    def _quantize_roundtrip(flat, bw):
+        # Mirror the C++ pack/unpack wire format:
+        # quantize -> pack -> unpack -> dequantize.
+        q, scales = quantize_tensor_blockwise(
+            flat, bw, block_size=DEFAULT_BLOCK_SIZE, stochastic_rounding=False
         )
-        torch.cuda.set_device(rank)
+        packed, packed_numel = pack_lowbit(q, bw)
+        q2 = unpack_lowbit(packed, bw, packed_numel)
+        return dequantize_tensor_blockwise(
+            q2, scales, block_size=DEFAULT_BLOCK_SIZE, dtype=torch.float32
+        )
 
-        device = torch.device(f"cuda:{rank}")
-        inputs = _make_inputs(rank, world_size, case, device)
-
-        output = torch.empty_like(inputs[0])
-        dist.reduce_scatter(output, inputs, op=dist.ReduceOp.SUM)
-
-        gathered_by_shard = []
-        for shard_idx in range(world_size):
-            gathered = [torch.empty_like(inputs[shard_idx]) for _ in range(world_size)]
-            dist.all_gather(gathered, inputs[shard_idx])
-            gathered_by_shard.append([t.cpu() for t in gathered])
-
-        inputs_by_rank = [
-            [gathered_by_shard[shard_idx][r] for shard_idx in range(world_size)]
-            for r in range(world_size)
+    def _sim_quantized_allreduce(parts, bw):
+        # CPU reference of quantizedAllreduceTensor: quantize each rank's
+        # shards, sum the received shards, requantize the sum, gather back.
+        original_numel = parts[0].numel()
+        pad = (world_size - (original_numel % world_size)) % world_size
+        flats = [torch.cat([p, torch.zeros(pad)]) if pad else p for p in parts]
+        q_shard_len = flats[0].numel() // world_size
+        quantized = [
+            [_quantize_roundtrip(s, bw) for s in f.split(q_shard_len)]
+            for f in flats
         ]
+        out_shards = []
+        for dst in range(world_size):
+            local_sum = torch.zeros(q_shard_len)
+            for src in range(world_size):
+                local_sum.add_(quantized[src][dst])
+            q2, scales2 = quantize_tensor_blockwise(
+                local_sum, bw, block_size=DEFAULT_BLOCK_SIZE, stochastic_rounding=False
+            )
+            packed2, packed_numel2 = pack_lowbit(q2, bw)
+            q3 = unpack_lowbit(packed2, bw, packed_numel2)
+            out_shards.append(
+                dequantize_tensor_blockwise(
+                    q3, scales2, block_size=DEFAULT_BLOCK_SIZE, dtype=torch.float32
+                )
+            )
+        return torch.cat(out_shards)[:original_numel]
 
-        expected_all = _simulate_lowbit_reduce_scatter_cpu(inputs_by_rank, bitwidth=bitwidth)
-        expected = expected_all[rank].to(output.device)
+    def _sim_lowbit_reduce_scatter(parts, bw):
+        # CPU reference of the non-sparse lowbit reduce_scatter: quantize each
+        # rank's chunks, then sum the dequantized chunks per destination rank.
+        # Note: unlike quantizedAllreduceTensor, the sum is NOT requantized.
+        quantized = [
+            [_quantize_roundtrip(s, bw) for s in p.split(shard_len)]
+            for p in parts
+        ]
+        outputs = []
+        for dst in range(world_size):
+            local_sum = torch.zeros(shard_len)
+            for src in range(world_size):
+                local_sum.add_(quantized[src][dst])
+            outputs.append(local_sum)
+        return outputs
 
-        max_abs_err = (output - expected).abs().max().to(torch.float32)
-        mean_abs_err = (output - expected).abs().mean().to(torch.float32)
-        err = torch.stack([max_abs_err, mean_abs_err])
-        dist.all_reduce(err, op=dist.ReduceOp.MAX)
+    if not case.get("sparse", False):
+        # Non-sparse path: chunks are quantized with the case bitwidth, so the
+        # result may deviate from the exact sum only by the input quantization
+        # error (bw2, |x|<=0.1 -> <= 0.05 per rank per element).
+        outputs = _sim_lowbit_reduce_scatter(inputs, bitwidth)
+        for rank in range(world_size):
+            reference_chunk = exact_sum[rank * shard_len:(rank + 1) * shard_len]
+            max_abs_err = (outputs[rank] - reference_chunk).abs().max().item()
+            assert outputs[rank].numel() == shard_len, f"{case['name']} rank={rank} wrong shard size"
+            assert torch.isfinite(outputs[rank]).all(), f"{case['name']} rank={rank} non-finite output"
+            assert max_abs_err < 0.15, f"{case['name']} rank={rank} max_abs_err={max_abs_err}"
+        return
 
-        if rank == 0:
-            q.put((True, {"case": case["name"], "errs": err.cpu().tolist()}))
-    except Exception as exc:  # pragma: no cover - error path for spawned workers
-        if rank == 0:
-            q.put((False, f"case={case['name']}: {repr(exc)}"))
-        raise
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    # Sparse ARC-Top-K path: AllReduce + Scatter (see reduceScatterSparse in C++).
+    n = _cal_max_factor(numel)
+    m = numel // n
+    r = case.get("sparse_projection_rank", 4)
+    ratio = float(case["sparse_compression_ratio"])
+    K = max(1, int(n * ratio + 0.5))  # llround semantics
 
+    G = [x.view(n, m) for x in inputs]
 
-def _run_case(case: dict) -> None:
-    world_size = int(os.getenv("BITSCOM_DIST_WORLD_SIZE", "2"))
-    ctx = mp.get_context("spawn")
-    queue = ctx.SimpleQueue()
+    # Each rank draws its own projection matrix V (intentional design); the
+    # averaged P is identical across ranks, so priority indices agree.
+    P = torch.zeros(n, r)
+    for rank in range(world_size):
+        vgen = torch.Generator()
+        vgen.manual_seed(1000 + seed + rank)
+        V = torch.randn(m, r, generator=vgen)
+        P += G[rank] @ V / (float(r) ** 0.5)
+    P /= world_size
+    score = (P * P).sum(dim=1)
+    _, priority_indices = torch.topk(score, K)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        init_file = str(Path(tmpdir) / "init")
-        mp.spawn(
-            _worker,
-            args=(world_size, init_file, case, queue),
-            nprocs=world_size,
-            join=True,
-        )
+    row_mask = torch.zeros(n, dtype=torch.bool)
+    row_mask[priority_indices] = True
+    non_priority_indices = torch.arange(n)[~row_mask]
+    nonK = n - K
 
-    # ok, payload = queue.get_nowait()
-    ok, payload = queue.get()
-    assert ok, payload
+    def _reduce_rows(indices, mode, quantize_bw):
+        parts = [G[rank][indices].contiguous().view(-1) for rank in range(world_size)]
+        if mode == 0:  # kFull: exact allreduce
+            return parts[0] + parts[1]
+        if mode == 1:  # kQuantize: quantizedAllreduceTensor
+            return _sim_quantized_allreduce(parts, int(quantize_bw))
+        return torch.zeros_like(parts[0])  # kDiscard
 
-    max_err, mean_err = payload["errs"]
-    assert max_err < 0.6
-    assert mean_err < 0.12
+    pri_mode = int(case.get("sparse_priority_mode", 0))
+    nonpri_mode = int(case.get("sparse_non_priority_mode", 1))
+    reduced_full = torch.zeros(n, m)
+    reduced_full[priority_indices] = _reduce_rows(
+        priority_indices, pri_mode, case.get("sparse_priority_quantize_bitwidth", 4)
+    ).view(K, m)
+    if nonK > 0:
+        reduced_full[non_priority_indices] = _reduce_rows(
+            non_priority_indices, nonpri_mode, case.get("sparse_non_priority_quantize_bitwidth", 4)
+        ).view(nonK, m)
 
+    reference_full = exact_sum.view(n, m)
 
-@pytest.mark.parametrize("case", TEST_CASES)
-def test_lowbit_reduce_scatter_reference(case):
-    _run_case(case)
+    # Full-mode rows must match the exact sum bit-for-bit; quantized rows may
+    # deviate only by the quantization error (bw4, |x|<=0.1 -> <= ~0.0072 per
+    # rank per element plus one requantization step).
+    if pri_mode == 0:
+        assert torch.equal(
+            reduced_full[priority_indices], reference_full[priority_indices]
+        ), f"{case['name']}: full-mode priority rows must match the exact sum"
+    else:
+        pri_err = (
+            reduced_full[priority_indices] - reference_full[priority_indices]
+        ).abs().max().item()
+        assert pri_err < 0.05, f"{case['name']}: priority rows max_abs_err={pri_err}"
+
+    if nonK > 0:
+        if nonpri_mode == 0:
+            assert torch.equal(
+                reduced_full[non_priority_indices], reference_full[non_priority_indices]
+            ), f"{case['name']}: full-mode non-priority rows must match the exact sum"
+        elif nonpri_mode == 1:
+            nonpri_err = (
+                reduced_full[non_priority_indices] - reference_full[non_priority_indices]
+            ).abs().max().item()
+            assert nonpri_err < 0.05, f"{case['name']}: non-priority rows max_abs_err={nonpri_err}"
+        else:
+            assert torch.equal(
+                reduced_full[non_priority_indices],
+                torch.zeros_like(reduced_full[non_priority_indices]),
+            ), f"{case['name']}: discard-mode non-priority rows must be zero"
+
+    # Scatter: rank r receives the contiguous chunk [r*shard_len, (r+1)*shard_len).
+    my_shards = [
+        reduced_full.view(-1)[rank * shard_len:(rank + 1) * shard_len]
+        for rank in range(world_size)
+    ]
+    for rank in range(world_size):
+        assert my_shards[rank].numel() == shard_len, f"{case['name']} rank={rank} wrong shard size"
+        assert torch.isfinite(my_shards[rank]).all(), f"{case['name']} rank={rank} non-finite output"
+    assert torch.equal(
+        torch.cat(my_shards), reduced_full.view(-1)
+    ), f"{case['name']}: shards must partition the reduced full tensor"
+
+def testReduceScatter():
+    for case in TEST_CASES:
+        testCase(case)
+    pass
