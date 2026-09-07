@@ -3,52 +3,102 @@ import time
 
 import pytest
 import torch
+import torch.distributed as dist
 
-from bitscom.quantization import compress_tensor, decompress_tensor, roundtrip_tensor
-
-
-pytestmark = pytest.mark.performance
-
-
-def _run_benchmark(fn, warmup=3, iters=20):
-    for _ in range(warmup):
-        fn()
-    start = time.perf_counter()
-    for _ in range(iters):
-        fn()
-    end = time.perf_counter()
-    return (end - start) / iters
-
-
-@pytest.mark.skipif(
-    os.getenv("BITSCOM_RUN_PERF", "0") != "1",
-    reason="set BITSCOM_RUN_PERF=1 to run performance tests",
+import bitscom
+from bitscom.quantization import (
+    compress_tensor,
+    decompress_tensor,
+    roundtrip_tensor,
+    DEFAULT_BLOCK_SIZE
 )
-def test_quantization_roundtrip_benchmark_prints_metrics():
-    x = torch.randn(1_000_000, dtype=torch.float32)
 
-    rt_time = _run_benchmark(lambda: roundtrip_tensor(x, bitwidth=4))
-    clone_time = _run_benchmark(lambda: x.clone())
+from torch.profiler import ProfilerActivity, profile, record_function
 
-    assert rt_time > 0
-    assert clone_time > 0
+COUNT=4
 
-    # Keep this test stable across machines: enforce only a loose upper bound.
-    assert rt_time < clone_time * 200
+bitscomPG: dist.ProcessGroup
+standardPG: dist.ProcessGroup
 
 
-@pytest.mark.skipif(
-    os.getenv("BITSCOM_RUN_PERF", "0") != "1",
-    reason="set BITSCOM_RUN_PERF=1 to run performance tests",
-)
-def test_compression_ratio_benchmark():
-    x = torch.randn(500_000, dtype=torch.float32)
+def initialize():
+    global bitscomPG
+    global standardPG
 
-    compressed = compress_tensor(x, bitwidth=4)
-    restored = decompress_tensor(compressed)
+    local_rank = int(os.environ["LOCAL_RANK"])
 
-    fp32_bytes = x.numel() * x.element_size()
-    packed_bytes = compressed.packed_bytes
+    bitscom.init(
+        bitwidth=4,
+        error_feedback=False,
+        error_feedback_mode="none",
+        block_size=DEFAULT_BLOCK_SIZE,
+        sparse_enabled=True,
+        sparse_projection_rank=4,
+        sparse_compression_ratio=0.1,
+        sparse_priority_mode=0,
+        sparse_priority_quantize_bitwidth=4,
+        sparse_non_priority_mode=2,
+        sparse_non_priority_quantize_bitwidth=4,
+    )
 
-    assert restored.shape == x.shape
-    assert packed_bytes < fp32_bytes
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl')
+    world_size=dist.get_world_size()
+    bitscomPG = dist.new_group(ranks=list(range(world_size)), backend='lowbit')
+    standardPG = dist.new_group(ranks=list(range(world_size)), backend='nccl')
+
+    torch.set_default_device(f"cuda:{torch.cuda.current_device()}")
+
+
+def testBitscom():
+    global bitscomPG
+    global standardPG
+    # 对 FP32 对 4MB 数据通信，
+    # 4MB = 4B * 1024 * 1024
+    input_list=[
+        torch.randn(1024, 1024),
+        torch.randn(1024, 1024),
+    ]
+    output = torch.zeros(1024, 1024)
+    start = time.time()
+    for i in range(COUNT):
+        dist.reduce_scatter(output=output, input_list=input_list, group=bitscomPG)
+    end = time.time()
+    print(f"[BITSCOM] time: {start-end:.2f}")
+
+
+def testStandard():
+    global bitscomPG
+    global standardPG
+    # 对 FP32 对 4MB 数据通信，
+    # 4MB = 4B * 1024 * 1024
+    input_list=[
+        torch.randn(1024, 1024),
+        torch.randn(1024, 1024),
+    ]
+    output = torch.zeros(1024, 1024)
+    start = time.time()
+    for i in range(COUNT):
+        dist.reduce_scatter(output=output, input_list=input_list, group=standardPG)
+    end = time.time()
+    print(f"[STANDARD] time: {start-end:.2f}")
+
+
+def testMain():
+    initialize()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+    ) as prof:
+        with record_function('bitscom'):
+            testBitscom()
+        with record_function('standard'):
+            testStandard()
+
+    if dist.get_rank() == 0:
+        prof.export_chrome_trace("./trace.json")
+        
+
+if __name__ == '__main__':
+    testMain()

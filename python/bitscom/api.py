@@ -8,6 +8,7 @@ from typing import Optional, List
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 
 from .quantization import (
     DEFAULT_BLOCK_SIZE,
@@ -1480,15 +1481,18 @@ class LowBitGroup:
         async_op: bool = False,
     ):
         """低比特 reduce_scatter。"""
+        with record_function("MARK: bitscom api reduce_scatter called"):
+            pass
         if self.simulate_quantization:
             for t in input_list:
                 t.copy_(roundtrip_tensor(t, self.bitwidth))
         work = dist.reduce_scatter(
             output, input_list, op=op, group=self.pg, async_op=True
         )
-        if not async_op:
-            work.wait()
-            return None
+        with record_function("wait for non async reduce scatter to complete"):
+            if not async_op:
+                work.wait()
+                return None
         return work
 
     def broadcast(

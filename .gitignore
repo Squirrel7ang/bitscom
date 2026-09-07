@@ -27,3 +27,6 @@ dist/
 *.so
 *.o
 *.a
+
+debug_logs/
+trace.json

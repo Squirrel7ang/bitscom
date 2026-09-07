@@ -8,6 +8,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <nccl.h>
+#include <torch/extension.h>
+#include <c10/util/ThreadLocalDebugInfo.h> // Provides RECORD_USER_SCOPE
 
 #include <condition_variable>
 #include <chrono>
@@ -22,6 +24,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+
 
 namespace bitscom {
 

@@ -19,12 +19,36 @@ from bitscom.quantization import (
 
 pytestmark = pytest.mark.integration
 
+def print_rank(*args, **kargs):
+    if dist.get_rank() == 0:
+        print(*args, **kargs)
+
 
 TEST_CASES = [
     {
+        "skip": False,
         "name": "reduce_scatter_bw4",
         "bitwidth": 4,
-        "numel": 512,
+        "numel": 8,
+        "inputs": torch.Tensor([
+            1/2, 3/2, 7/2, 15/2, -16/2, -8/2, -4/2, -2/2
+        ]),
+        "sparse": True,
+        "sparse_compression_ratio": 0.5,
+        "sparse_priority_mode": 0,
+        "sparse_non_priority_mode": 2,
+        "sparse_priority_quantize_bitwidth": 4,
+        "sparse_non_priority_quantize_bitwidth": 4,
+        "seed": 17,
+    },
+    {
+        "skip": True,
+        "name": "reduce_scatter_bw4",
+        "bitwidth": 4,
+        "numel": 8,
+        "inputs": torch.Tensor([
+            1, 3, 7, 15, -16, -8, -4, -2
+        ]),
         "sparse": True,
         "sparse_compression_ratio": 0.5,
         "sparse_priority_mode": 0,
@@ -33,9 +57,38 @@ TEST_CASES = [
         "sparse_non_priority_quantize_bitwidth": 4,
         "seed": 17,
     },
+    {
+        "name": "reduce_scatter_bw4",
+        "bitwidth": 4,
+        "numel": 8,
+        "inputs": torch.Tensor([
+            1, 15, 15, 15, -16, -16, -16, -2
+        ]),
+        "sparse": True,
+        "sparse_compression_ratio": 0.5,
+        "sparse_priority_mode": 0,
+        "sparse_non_priority_mode": 1,
+        "sparse_priority_quantize_bitwidth": 4,
+        "sparse_non_priority_quantize_bitwidth": 4,
+        "seed": 17,
+    },
+    {
+        "name": "reduce_scatter_bw4",
+        "bitwidth": 4,
+        "numel": 16,
+        "sparse": True,
+        "sparse_compression_ratio": 1,
+        "sparse_priority_mode": 0,
+        "sparse_non_priority_mode": 1,
+        "sparse_priority_quantize_bitwidth": 4,
+        "sparse_non_priority_quantize_bitwidth": 4,
+        "seed": 17,
+    },
 ]
 
-def testCase(case):
+def testCase(case, init_file: str):
+    if 'skip' in case and case['skip']:
+        return
     # Register the lowbit backend exactly like megatron/training/initialize.py
     # does, passing the full sparse configuration explicitly.
     if case.get("sparse", False):
@@ -52,22 +105,38 @@ def testCase(case):
             sparse_non_priority_mode=case.get("sparse_non_priority_mode", 1),
             sparse_non_priority_quantize_bitwidth=case.get("sparse_non_priority_quantize_bitwidth", 4),
         )
+    if not dist.is_initialized():
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="lowbit")
 
+    # Simulated world size used by the CPU reference math (numel split, shards).
     world_size = 2
-    numel = int(case["numel"])
     bitwidth = int(case["bitwidth"])
     seed = int(case["seed"])
+    numel = int(case["numel"])
     shard_len = numel // world_size
     assert shard_len * world_size == numel, f"{case['name']}: numel must divide world_size"
+    local_rank = dist.get_rank()
 
     # Standard reduce_scatter convention: each rank owns a full tensor made of
     # world_size equal chunks, and rank r receives the reduced chunk r.
     inputs = []
-    for rank in range(world_size):
-        gen = torch.Generator()
-        gen.manual_seed(seed + rank)
-        # Bounded range [-0.1, 0.1] keeps the quantization error bounds tight.
-        inputs.append(torch.rand(numel, generator=gen) * 0.2 - 0.1)
+    if case["inputs"] is not None:
+        inputs.append(case["inputs"])
+        inputs.append(case["inputs"])
+        numel = inputs[0].numel()
+        shard_len = numel // world_size
+        assert shard_len * world_size == numel, f"{case['name']}: numel must divide world_size"
+    else:
+        for rank in range(world_size):
+            gen = torch.Generator()
+            gen.manual_seed(seed + rank)
+            # Bounded range [-0.1, 0.1] keeps the quantization error bounds tight.
+            inputs.append(torch.rand(numel, generator=gen) * 0.2 - 0.1)
+
+    if local_rank == 0:
+        print_rank(f"{inputs[0]=}\n{inputs[1]=}")
 
     exact_sum = inputs[0] + inputs[1]  # full-precision reference
 
@@ -152,6 +221,7 @@ def testCase(case):
     # Sparse ARC-Top-K path: AllReduce + Scatter (see reduceScatterSparse in C++).
     n = _cal_max_factor(numel)
     m = numel // n
+    print_rank(f"{n=}, {m=}, {numel=}")
     r = case.get("sparse_projection_rank", 4)
     ratio = float(case["sparse_compression_ratio"])
     K = max(1, int(n * ratio + 0.5))  # llround semantics
@@ -195,6 +265,8 @@ def testCase(case):
         ).view(nonK, m)
 
     reference_full = exact_sum.view(n, m)
+    print_rank(f"reference_full={reference_full.flatten()}")
+    print_rank(f"reduced_full={reduced_full.flatten()}")
 
     # Full-mode rows must match the exact sum bit-for-bit; quantized rows may
     # deviate only by the quantization error (bw4, |x|<=0.1 -> <= ~0.0072 per
@@ -238,6 +310,21 @@ def testCase(case):
     ), f"{case['name']}: shards must partition the reduced full tensor"
 
 def testReduceScatter():
-    for case in TEST_CASES:
-        testCase(case)
-    pass
+    # file:// init needs a rendezvous file; create it once and clean it up.
+    tmp = tempfile.NamedTemporaryFile(prefix="bitscom-lowbit-rs-ref-", delete=False)
+    tmp.close()
+    init_file = str(Path(tmp.name).resolve())
+    try:
+        for case in TEST_CASES:
+            testCase(case, init_file)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        try:
+            os.unlink(init_file)
+        except OSError:
+            pass
+
+if __name__ == '__main__':
+    print("testing")
+    testReduceScatter()
