@@ -2412,11 +2412,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
 
                 int r = options_.sparse_projection_rank;
                 auto V = at::randn({m, r}, G.options());
-                auto P_local = at::matmul(G, V) / std::sqrt(static_cast<float>(r));
+                auto P_local = at::matmul(G, V);
 
                 std::vector<at::Tensor> p_vec = {P_local};
                 nccl_pg_->allreduce(p_vec)->wait();
-                auto P_global = p_vec[0] / static_cast<float>(world_size);
+                auto P_global = p_vec[0];
 
                 auto score = at::sum(P_global * P_global, 1);
                 K = std::max(int64_t(1),
@@ -2424,6 +2424,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                         static_cast<double>(n) * options_.sparse_compression_ratio)));
                 auto topk_result = at::topk(score, K); // 应该可以优化，因为这里默认实现应该是 O(nlogn) 不够好
                 auto priority_indices = std::get<1>(topk_result);
+                priority_indices = std::get<0>(at::sort(priority_indices));
 
                 auto all_idx = at::arange(n, priority_indices.options());
                 auto mask = at::zeros({n}, at::TensorOptions().dtype(at::kBool).device(output.device()));
