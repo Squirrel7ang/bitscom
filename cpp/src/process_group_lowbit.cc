@@ -2236,6 +2236,18 @@ bool ProcessGroupLowBit::shouldUseSparseReduceScatter(
 }
 
 // Reduce Scatter 量化核心代码
+/**
+* 这里应该是量化的 ReduceScatter。但是实现是使用一个 All2All 来完成
+* rank 0: a0  a1  a2  a3
+* rank 1: b0  b1  b2  b3
+* rank 2: c0  c1  c2  c3
+* rank 3: d0  d1  d2  d3
+* =>
+* rank 0: a0  b0  c0  d0 -> reduce
+* rank 1: a1  b1  c1  d1 -> reduce
+* rank 2: a2  b2  c2  d2 -> reduce
+* rank 3: a3  b3  c3  d3 -> reduce
+*/
 at::Tensor ProcessGroupLowBit::quantizedReduceScatterPart(
     const std::vector<at::Tensor>& inputs, int bitwidth) {
     // 对 inputs（world_size 个等长 flat tensor）执行 pack→alltoall→unpack→sum
@@ -2374,6 +2386,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
             // 残差按「本 rank 的 output shard」维度存储（numel == shard_len）。
             int64_t tensor_id = 0;
             {
+                /**
+                 * TODO: 这一块误差反馈要全部重写。
+                 */
                 RECORD_USER_SCOPE("ErrorFeedBack")
                 if (stage1_ef) {
                     tensor_id = static_cast<int64_t>(
@@ -2426,6 +2441,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                 auto priority_indices = std::get<1>(topk_result);
                 priority_indices = std::get<0>(at::sort(priority_indices));
 
+                // 这一部分也要优化，已经有 priority 不需要这么麻烦。
+                // 重写一遍一次把 p 和 nonp 都捞出来，包括 indices 和 rows
                 auto all_idx = at::arange(n, priority_indices.options());
                 auto mask = at::zeros({n}, at::TensorOptions().dtype(at::kBool).device(output.device()));
                 mask.index_put_({priority_indices}, true); // 开销大头
@@ -2449,12 +2466,15 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                 RECORD_USER_SCOPE("Priority Full");
                 auto pri_flat = priority_rows.contiguous().view(-1);
                 std::vector<at::Tensor> pri_vec = {pri_flat};
-                nccl_pg_->allreduce(pri_vec)->wait();
+                /**
+                 * TODO: 调用 reduce_scatter
+                 */
+                nccl_pg_->reduce_scatter(pri_vec)->wait();
                 reduced_priority = pri_vec[0].view({K, m});
             } else if (pri_mode == SparseCommMode::kQuantize) { // Quantize: 复用 sparse allreduce
                 RECORD_USER_SCOPE("Priority Quant");
                 auto pri_flat = priority_rows.contiguous().view(-1);
-                sparseAllreduceTensor(pri_flat);
+                quantizedReduceScatterPart(nonpri_flat)
                 // sparseAllreduceTensor 会把临时 tensor 的 EF 残差写进 cache；
                 // 该临时 tensor 下一轮不复用，清掉以免脏 key 碰撞/显存泄漏
                 if (stage1_ef) {
@@ -2476,12 +2496,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                 RECORD_USER_SCOPE("NonPriority Full");
                 auto nonpri_flat = non_priority_rows.contiguous().view(-1);
                 std::vector<at::Tensor> nonpri_vec = {nonpri_flat};
-                nccl_pg_->allreduce(nonpri_vec)->wait();
+                nccl_pg_->reduce_scatter(nonpri_vec)->wait(); // TODO
                 reduced_non_priority = nonpri_vec[0].view({nonK, m});
             } else if (nonpri_mode == SparseCommMode::kQuantize) { // Quantize: 复用 sparse allreduce
                 RECORD_USER_SCOPE("NonPriority Quant");
                 auto nonpri_flat = non_priority_rows.contiguous().view(-1);
-                sparseAllreduceTensor(nonpri_flat);
+                quantizedReduceScatterPart(nonpri_flat)
+                // sparseAllreduceTensor(nonpri_flat);
                 if (stage1_ef) {
                     auto temp_id = static_cast<int64_t>(
                         reinterpret_cast<uintptr_t>(nonpri_flat.unsafeGetTensorImpl()));
@@ -2491,6 +2512,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                 reduced_non_priority = nonpri_flat.view({nonK, m});
             } else { // Discard: 置零
                 RECORD_USER_SCOPE("NonPriority Discard");
+                /**
+                 * TODO: 不需要创建矩阵，这里后面判断就好了
+                 */
                 reduced_non_priority = at::zeros_like(non_priority_rows);
             }
 
