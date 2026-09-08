@@ -40,6 +40,7 @@ def init(
     sparse_enabled: bool = False,
     sparse_projection_rank: int = 4,
     sparse_compression_ratio: float = 0.1,
+    sparse_row_width: int = 128,         # 矩阵列宽 m（每行元素个数）
     sparse_priority_mode: int = 0,       # 0=kFull, 1=kQuantize, 2=kDiscard
     sparse_priority_quantize_bitwidth: int = 4,
     sparse_non_priority_mode: int = 1,   # 0=kFull, 1=kQuantize, 2=kDiscard
@@ -58,6 +59,7 @@ def init(
         sparse_enabled=sparse_enabled,
         sparse_projection_rank=sparse_projection_rank,
         sparse_compression_ratio=sparse_compression_ratio,
+        sparse_row_width=sparse_row_width,
         sparse_priority_mode=sparse_priority_mode,
         sparse_priority_quantize_bitwidth=sparse_priority_quantize_bitwidth,
         sparse_non_priority_mode=sparse_non_priority_mode,

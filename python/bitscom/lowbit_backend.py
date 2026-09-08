@@ -37,6 +37,7 @@ _BACKEND_STAGE2_ERROR_FEEDBACK = False
 _BACKEND_SPARSE_ENABLED = False
 _BACKEND_SPARSE_PROJECTION_RANK = 4
 _BACKEND_SPARSE_COMPRESSION_RATIO = 0.1
+_BACKEND_SPARSE_ROW_WIDTH = 128
 _BACKEND_SPARSE_PRIORITY_MODE = 0       # SparseCommMode::kFull
 _BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH = 4
 _BACKEND_SPARSE_NON_PRIORITY_MODE = 1   # SparseCommMode::kQuantize
@@ -76,6 +77,7 @@ def _create_lowbit_pg(store, rank, size, timeout):
         sparse_enabled=_BACKEND_SPARSE_ENABLED,
         sparse_projection_rank=_BACKEND_SPARSE_PROJECTION_RANK,
         sparse_compression_ratio=_BACKEND_SPARSE_COMPRESSION_RATIO,
+        sparse_row_width=_BACKEND_SPARSE_ROW_WIDTH,
         sparse_priority_mode=_BACKEND_SPARSE_PRIORITY_MODE,
         sparse_priority_quantize_bitwidth=_BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH,
         sparse_non_priority_mode=_BACKEND_SPARSE_NON_PRIORITY_MODE,
@@ -108,6 +110,7 @@ def register_lowbit_backend(
     sparse_enabled: bool = False,
     sparse_projection_rank: int = 4,
     sparse_compression_ratio: float = 0.1,
+    sparse_row_width: int = 128,         # 矩阵列宽 m（每行元素个数）
     sparse_priority_mode: int = 0,       # SparseCommMode: 0=kFull, 1=kQuantize, 2=kDiscard
     sparse_priority_quantize_bitwidth: int = 4,
     sparse_non_priority_mode: int = 1,   # SparseCommMode: 0=kFull, 1=kQuantize, 2=kDiscard
@@ -130,6 +133,7 @@ def register_lowbit_backend(
     global _BACKEND_SPARSE_ENABLED
     global _BACKEND_SPARSE_PROJECTION_RANK
     global _BACKEND_SPARSE_COMPRESSION_RATIO
+    global _BACKEND_SPARSE_ROW_WIDTH
     global _BACKEND_SPARSE_PRIORITY_MODE
     global _BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH
     global _BACKEND_SPARSE_NON_PRIORITY_MODE
@@ -165,6 +169,7 @@ def register_lowbit_backend(
             or sparse_enabled != _BACKEND_SPARSE_ENABLED
             or sparse_projection_rank != _BACKEND_SPARSE_PROJECTION_RANK
             or sparse_compression_ratio != _BACKEND_SPARSE_COMPRESSION_RATIO
+            or sparse_row_width != _BACKEND_SPARSE_ROW_WIDTH
             or sparse_priority_mode != _BACKEND_SPARSE_PRIORITY_MODE
             or sparse_priority_quantize_bitwidth != _BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH
             or sparse_non_priority_mode != _BACKEND_SPARSE_NON_PRIORITY_MODE
@@ -183,6 +188,7 @@ def register_lowbit_backend(
     _BACKEND_SPARSE_ENABLED = bool(sparse_enabled)
     _BACKEND_SPARSE_PROJECTION_RANK = int(sparse_projection_rank)
     _BACKEND_SPARSE_COMPRESSION_RATIO = float(sparse_compression_ratio)
+    _BACKEND_SPARSE_ROW_WIDTH = int(sparse_row_width)
     _BACKEND_SPARSE_PRIORITY_MODE = int(sparse_priority_mode)
     _BACKEND_SPARSE_PRIORITY_QUANTIZE_BITWIDTH = int(sparse_priority_quantize_bitwidth)
     _BACKEND_SPARSE_NON_PRIORITY_MODE = int(sparse_non_priority_mode)

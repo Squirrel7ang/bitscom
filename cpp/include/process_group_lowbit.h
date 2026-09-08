@@ -56,6 +56,7 @@ struct LowBitOptions {
     bool sparse_enabled = false;
     int sparse_projection_rank = 4;
     float sparse_compression_ratio = 0.1f;
+    int sparse_row_width = 128;   // 矩阵列宽 m（每行元素个数）；不可整除时尾部 padding
     SparseCommMode sparse_priority_mode = SparseCommMode::kFull;
     int sparse_priority_quantize_bitwidth = 4;          // priority 行量化位宽（mode==kQuantize 时生效）
     SparseCommMode sparse_non_priority_mode = SparseCommMode::kQuantize;
@@ -248,7 +249,7 @@ private:
         std::vector<at::Tensor>& tensors,
         const c10d::AllreduceOptions& opts);
     void sparseAllreduceTensor(at::Tensor& tensor);
-    at::Tensor quantizedAllreduceTensor(const at::Tensor& flat, int bitwidth);
+    void quantizedAllreduceTensor(at::Tensor& tensor, int bitwidth);
 
     // ---- sparse ARC-Top-K reduce_scatter ----
     bool shouldUseSparseReduceScatter(const c10d::ReduceScatterOptions& opts) const;
@@ -313,6 +314,7 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     bool sparse_enabled,
     int sparse_projection_rank,
     float sparse_compression_ratio,
+    int sparse_row_width,
     int sparse_priority_mode,
     int sparse_priority_quantize_bitwidth,
     int sparse_non_priority_mode,

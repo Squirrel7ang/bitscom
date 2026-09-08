@@ -29,6 +29,7 @@ c10::intrusive_ptr<c10d::Backend> createBackend(
     bool sparse_enabled,
     int sparse_projection_rank,
     float sparse_compression_ratio,
+    int sparse_row_width,
     int sparse_priority_mode,
     int sparse_priority_quantize_bitwidth,
     int sparse_non_priority_mode,
@@ -46,6 +47,7 @@ c10::intrusive_ptr<c10d::Backend> createBackend(
         sparse_enabled,
         sparse_projection_rank,
         sparse_compression_ratio,
+        sparse_row_width,
         sparse_priority_mode,
         sparse_priority_quantize_bitwidth,
         sparse_non_priority_mode,
@@ -66,6 +68,7 @@ PYBIND11_MODULE(_lowbit_c, m) {
         .def_readwrite("sparse_enabled", &bitscom::LowBitOptions::sparse_enabled)
         .def_readwrite("sparse_projection_rank", &bitscom::LowBitOptions::sparse_projection_rank)
         .def_readwrite("sparse_compression_ratio", &bitscom::LowBitOptions::sparse_compression_ratio)
+        .def_readwrite("sparse_row_width", &bitscom::LowBitOptions::sparse_row_width)
         .def_readwrite("sparse_priority_mode", &bitscom::LowBitOptions::sparse_priority_mode)
         .def_readwrite("sparse_priority_quantize_bitwidth", &bitscom::LowBitOptions::sparse_priority_quantize_bitwidth)
         .def_readwrite("sparse_non_priority_mode", &bitscom::LowBitOptions::sparse_non_priority_mode)
@@ -157,6 +160,7 @@ PYBIND11_MODULE(_lowbit_c, m) {
                         py::arg("sparse_enabled") = false,
                         py::arg("sparse_projection_rank") = 4,
                         py::arg("sparse_compression_ratio") = 0.1f,
+                        py::arg("sparse_row_width") = 128,
                         py::arg("sparse_priority_mode") = 0,
                         py::arg("sparse_priority_quantize_bitwidth") = 4,
                         py::arg("sparse_non_priority_mode") = 1,

@@ -1951,16 +1951,16 @@ bool ProcessGroupLowBit::shouldUseSparseAllreduce(
         getSize() > 1;
 }
 
-at::Tensor ProcessGroupLowBit::quantizedAllreduceTensor(
-    const at::Tensor& flat_input, int bitwidth) {
+void ProcessGroupLowBit::quantizedAllreduceTensor(
+    at::Tensor& tensor, int bitwidth) {
     // 对一个 flat float tensor 执行量化 allreduce（SUM 语义）。
-    // 使用指定的 bitwidth 进行 pack/unpack。
-    auto flat = flat_input.contiguous().view(-1).to(at::kFloat);
+    // 使用指定的 bitwidth 进行 pack/unpack。归约结果原地写回 tensor。
+    auto flat = tensor.contiguous().view(-1).to(at::kFloat);
     int64_t original_numel = flat.numel();
     const int world_size = getSize();
 
     if (original_numel == 0) {
-        return flat;
+        return;
     }
 
     // 补齐到 world_size 的整数倍
@@ -2050,7 +2050,8 @@ at::Tensor ProcessGroupLowBit::quantizedAllreduceTensor(
     }
 
     auto result = at::cat(out_shards, 0).slice(0, 0, original_numel);
-    return result;
+    // 归约结果原地写回输入 tensor（copy_ 自带 dtype 转换）。
+    tensor.copy_(result.view_as(tensor));
 }
 
 void ProcessGroupLowBit::sparseAllreduceTensor(at::Tensor& tensor) {
@@ -2139,9 +2140,9 @@ void ProcessGroupLowBit::sparseAllreduceTensor(at::Tensor& tensor) {
         reduced_priority = pri_vec[0].view({K, m});
     } else if (pri_mode == SparseCommMode::kQuantize) {
         auto pri_flat = priority_rows.contiguous().view(-1);
-        auto reduced_flat = quantizedAllreduceTensor(
+        quantizedAllreduceTensor(
             pri_flat, options_.sparse_priority_quantize_bitwidth);
-        reduced_priority = reduced_flat.view({K, m});
+        reduced_priority = pri_flat.view({K, m});
     } else {
         reduced_priority = at::zeros_like(priority_rows);  // kDiscard
     }
@@ -2157,9 +2158,9 @@ void ProcessGroupLowBit::sparseAllreduceTensor(at::Tensor& tensor) {
             reduced_non_priority = nonpri_vec[0].view({nonK, m});
         } else if (nonpri_mode == SparseCommMode::kQuantize) {
             auto nonpri_flat = non_priority_rows.contiguous().view(-1);
-            auto reduced_flat = quantizedAllreduceTensor(
+            quantizedAllreduceTensor(
                 nonpri_flat, options_.sparse_non_priority_quantize_bitwidth);
-            reduced_non_priority = reduced_flat.view({nonK, m});
+            reduced_non_priority = nonpri_flat.view({nonK, m});
         } else {
             reduced_non_priority = at::zeros_like(non_priority_rows);  // kDiscard
         }
@@ -2421,9 +2422,17 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
             // ====== ARC-Top-K（基于完整张量） ======
             {
                 RECORD_USER_SCOPE("ARC-Top-K");
-                n = calMaxFactor(full_numel);
-                m = full_numel / n;
-                G = full_flat.view({n, m});
+                // 固定列宽 m（可配置 sparse_row_width），n = ceil(full_numel / m)；
+                // full_numel 不能被 m 整除时，在尾部 padding 到 n*m，通信后再按 shard 切掉。
+                m = options_.sparse_row_width;
+                n = (full_numel + m - 1) / m;
+                int64_t padded_numel = n * m;
+                at::Tensor padded_flat = full_flat;
+                if (padded_numel != full_numel) {
+                    padded_flat = at::cat(
+                        {full_flat, at::zeros({padded_numel - full_numel}, full_flat.options())}, 0);
+                }
+                G = padded_flat.view({n, m});
 
                 int r = options_.sparse_projection_rank;
                 auto V = at::randn({m, r}, G.options());
@@ -2457,7 +2466,15 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
             }
             
 
-            // ====== AllReduce（三条路径） ======
+            /** ****** AllReduce（三条路径） ******
+             * 注意，这里要使用 all_reduce 来同步数据，之后舍弃掉一部分数据。这是最麻烦的地方。
+             * 举个例子
+             * rank 0: pri0  nonp0  nonp1  pri1
+             * rank 1: pri2  nonp2  nonp3  pri3
+             * 但是我们需要的结果是
+             * rank 0: pri0+pri2  nonp0+nonp2
+             * rank1: nonp1+nonp3  pri1+pri3
+             */
             const auto pri_mode = options_.sparse_priority_mode;
             const auto nonpri_mode = options_.sparse_non_priority_mode;
 
@@ -2466,56 +2483,36 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                 RECORD_USER_SCOPE("Priority Full");
                 auto pri_flat = priority_rows.contiguous().view(-1);
                 std::vector<at::Tensor> pri_vec = {pri_flat};
-                /**
-                 * TODO: 调用 reduce_scatter
-                 */
-                nccl_pg_->reduce_scatter(pri_vec)->wait();
+                nccl_pg_->allreduce(pri_vec)->wait();
                 reduced_priority = pri_vec[0].view({K, m});
             } else if (pri_mode == SparseCommMode::kQuantize) { // Quantize: 复用 sparse allreduce
                 RECORD_USER_SCOPE("Priority Quant");
                 auto pri_flat = priority_rows.contiguous().view(-1);
-                quantizedReduceScatterPart(nonpri_flat)
-                // sparseAllreduceTensor 会把临时 tensor 的 EF 残差写进 cache；
-                // 该临时 tensor 下一轮不复用，清掉以免脏 key 碰撞/显存泄漏
-                if (stage1_ef) {
-                    auto temp_id = static_cast<int64_t>(
-                        reinterpret_cast<uintptr_t>(pri_flat.unsafeGetTensorImpl()));
-                    std::lock_guard<std::mutex> lock(residual_mutex_);
-                    residual_cache_.erase(temp_id);
-                }
+                quantizedAllreduceTensor(
+                    pri_flat, options_.sparse_priority_quantize_bitwidth);
                 reduced_priority = pri_flat.view({K, m});
             } else { // Discard: 置零即可，无需通信（各 rank 的 collective 序列一致）
                 RECORD_USER_SCOPE("Priority Discard");
-                reduced_priority = at::zeros_like(priority_rows);
+                // reduced_priority = at::zeros_like(priority_rows);
+                // do nothing
             }
 
             at::Tensor reduced_non_priority;
-            if (nonK == 0) {
-                reduced_non_priority = at::zeros({0, m}, G.options());
+            if (nonK <= 0 || nonpri_mode == SparseCommMode::kDiscard) {
+                RECORD_USER_SCOPE("Non-Priority Discard");
+                // do nothing
             } else if (nonpri_mode == SparseCommMode::kFull) { // Full: nccl 全精度 allreduce
                 RECORD_USER_SCOPE("NonPriority Full");
                 auto nonpri_flat = non_priority_rows.contiguous().view(-1);
                 std::vector<at::Tensor> nonpri_vec = {nonpri_flat};
-                nccl_pg_->reduce_scatter(nonpri_vec)->wait(); // TODO
+                nccl_pg_->allreduce(nonpri_vec)->wait();
                 reduced_non_priority = nonpri_vec[0].view({nonK, m});
             } else if (nonpri_mode == SparseCommMode::kQuantize) { // Quantize: 复用 sparse allreduce
                 RECORD_USER_SCOPE("NonPriority Quant");
                 auto nonpri_flat = non_priority_rows.contiguous().view(-1);
-                quantizedReduceScatterPart(nonpri_flat)
-                // sparseAllreduceTensor(nonpri_flat);
-                if (stage1_ef) {
-                    auto temp_id = static_cast<int64_t>(
-                        reinterpret_cast<uintptr_t>(nonpri_flat.unsafeGetTensorImpl()));
-                    std::lock_guard<std::mutex> lock(residual_mutex_);
-                    residual_cache_.erase(temp_id);
-                }
+                quantizedAllreduceTensor(
+                    nonpri_flat, options_.sparse_non_priority_quantize_bitwidth);
                 reduced_non_priority = nonpri_flat.view({nonK, m});
-            } else { // Discard: 置零
-                RECORD_USER_SCOPE("NonPriority Discard");
-                /**
-                 * TODO: 不需要创建矩阵，这里后面判断就好了
-                 */
-                reduced_non_priority = at::zeros_like(non_priority_rows);
             }
 
             // ====== 拼接恢复成完整张量 → Scatter ======
@@ -2523,13 +2520,17 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
             {
                 RECORD_USER_SCOPE("Cat back");
                 auto reduced_full = at::zeros({n, m}, G.options());
-                reduced_full.index_put_({priority_indices}, reduced_priority);
-                if (nonK > 0) {
+                if (pri_mode != SparseCommMode::kDiscard){
+                    reduced_full.index_put_({priority_indices}, reduced_priority);
+                }
+                if (nonpri_mode != SparseCommMode::kDiscard && nonK > 0) {
                     reduced_full.index_put_({non_priority_indices}, reduced_non_priority);
                 }
 
                 // 按连续 chunk 切分：本 rank 拿到 [rank*shard_len, (rank+1)*shard_len)
-                my_shard = reduced_full.view({full_numel}).slice(
+                // 注意 reduced_full 是 padded 后的 n*m 张量，尾部 padding 落在所有 shard 之外，
+                // 因此直接按原 full_numel 的 shard 边界切即可自然去掉 padding。
+                my_shard = reduced_full.view({n * m}).slice(
                     0, rank * shard_len, (rank + 1) * shard_len);
                 {
                     RECORD_USER_SCOPE("copy shard")
@@ -2554,9 +2555,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
 
         auto work = c10::make_intrusive<WorkBitscom>();
         work->markCompleted(true);
-        {
-            RECORD_USER_SCOPE("Return Work");
-        }
         return work;
     } catch (const std::exception& e) {
         lowbitBackendTiming(this, getRank(),
@@ -2586,6 +2584,7 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     bool sparse_enabled,
     int sparse_projection_rank,
     float sparse_compression_ratio,
+    int sparse_row_width,
     int sparse_priority_mode,
     int sparse_priority_quantize_bitwidth,
     int sparse_non_priority_mode,
@@ -2601,6 +2600,7 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     opts.sparse_enabled = sparse_enabled;
     opts.sparse_projection_rank = sparse_projection_rank;
     opts.sparse_compression_ratio = sparse_compression_ratio;
+    opts.sparse_row_width = sparse_row_width;
     opts.sparse_priority_mode = static_cast<SparseCommMode>(sparse_priority_mode);
     opts.sparse_priority_quantize_bitwidth = sparse_priority_quantize_bitwidth;
     opts.sparse_non_priority_mode = static_cast<SparseCommMode>(sparse_non_priority_mode);
