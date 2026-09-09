@@ -138,6 +138,19 @@ def _collect_library_dirs():
     if env_lib and _existing(env_lib):
         lib_dirs.append(env_lib)
 
+    cuda_home = os.environ.get("CUDA_HOME")
+    if not cuda_home and os.path.isdir("/usr/local/corex-4.4.0"):
+        cuda_home = "/usr/local/corex-4.4.0"
+    if not cuda_home:
+        cuda_home = "/usr/local/cuda"
+    for p in [
+        os.path.join(cuda_home, "lib64"),
+        os.path.join(cuda_home, "lib"),
+        os.path.join(cuda_home, "targets", "x86_64-linux", "lib"),
+    ]:
+        if _existing(p):
+            lib_dirs.append(p)
+
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
         for p in [
