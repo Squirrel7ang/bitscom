@@ -2415,7 +2415,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
             at::Tensor non_priority_rows;
             at::Tensor G;
             at::Tensor priority_indices;
-            at::Tensor non_priority_indices;
+            at::Tensor is_non_priority;
             int64_t nonK;
             int64_t K;
             int64_t n, m;
@@ -2447,21 +2447,23 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                     static_cast<int64_t>(std::llround(
                         static_cast<double>(n) * options_.sparse_compression_ratio)));
                 auto topk_result = at::topk(score, K); // 应该可以优化，因为这里默认实现应该是 O(nlogn) 不够好
-                auto priority_indices = std::get<1>(topk_result);
+                priority_indices = std::get<1>(topk_result);
                 priority_indices = std::get<0>(at::sort(priority_indices));
 
-                // 这一部分也要优化，已经有 priority 不需要这么麻烦。
-                // 重写一遍一次把 p 和 nonp 都捞出来，包括 indices 和 rows
-                auto all_idx = at::arange(n, priority_indices.options());
-                auto mask = at::zeros({n}, at::TensorOptions().dtype(at::kBool).device(output.device()));
-                mask.index_put_({priority_indices}, true); // 开销大头
-                auto non_priority_indices = all_idx.masked_select(mask.logical_not());
+                // priority_indices 已升序 [K]。补集用一个 bool 掩码 + 一次 scatter 得到：
+                // ones + scatter(false) 比之前的 zeros + index_put_(true) + logical_not 更轻，
+                // 且 scatter_ 走 1-D 专用 kernel，绕开了 advanced indexing 的 index_put_。
+                // 掩码 hoist 到外层，供下面的 masked_select / masked_scatter 复用，
+                // 不再单独物化 non_priority_indices 这个索引数组。
+                is_non_priority = at::ones({n},
+                    at::TensorOptions().dtype(at::kBool).device(G.device()));
+                is_non_priority.scatter_(0, priority_indices, false);
                 nonK = n - K;
 
                 // ====== 提取本 rank 的 priority / non-priority 行 ======
                 priority_rows = G.index_select(0, priority_indices);           // K×m
                 non_priority_rows = (nonK > 0)
-                    ? G.index_select(0, non_priority_indices)
+                    ? G.masked_select(is_non_priority.view({n, 1})).view({nonK, m})
                     : at::zeros({0, m}, G.options());
             }
             
@@ -2521,10 +2523,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                 RECORD_USER_SCOPE("Cat back");
                 auto reduced_full = at::zeros({n, m}, G.options());
                 if (pri_mode != SparseCommMode::kDiscard){
-                    reduced_full.index_put_({priority_indices}, reduced_priority);
+                    reduced_full.index_copy_(0, priority_indices, reduced_priority);
                 }
                 if (nonpri_mode != SparseCommMode::kDiscard && nonK > 0) {
-                    reduced_full.index_put_({non_priority_indices}, reduced_non_priority);
+                    reduced_full.masked_scatter_(is_non_priority.view({n, 1}),
+                                                 reduced_non_priority.view(-1));
                 }
 
                 // 按连续 chunk 切分：本 rank 拿到 [rank*shard_len, (rank+1)*shard_len)
