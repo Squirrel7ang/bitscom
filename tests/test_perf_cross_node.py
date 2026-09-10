@@ -34,8 +34,6 @@ import torch.distributed as dist
 import bitscom
 from bitscom.quantization import DEFAULT_BLOCK_SIZE
 
-from torch.profiler import ProfilerActivity, profile, record_function
-
 
 # ================= 可调参数 =================
 COUNT = 4                      # 每个 backend 的迭代次数
@@ -120,7 +118,6 @@ def main():
     # 显式 timeout，避免网络不通时无限挂起（torchrun 默认也有，这里兜底）
     dist.init_process_group(
         backend="nccl",
-        init_method="env://",
         timeout=timedelta(seconds=60),
     )
     log(f"[{rank}] step2: init_process_group done (nccl)")
@@ -169,6 +166,7 @@ def main():
         bw_gbps = bytes_per_iter / (elapsed / COUNT) / 1e9
         log(f"[{r}] [BITSCOM] {COUNT} iters: total {elapsed:.4f}s, "
             f"avg {avg_ms:.2f}ms, ~{bw_gbps:.2f} GB/s")
+        return elapsed
 
     def bench_standard():
         # 标准 NCCL 用 reduce_scatter_tensor：单个输入张量，自动按 world_size 沿 dim0 切分。
@@ -202,20 +200,19 @@ def main():
         bw_gbps = bytes_per_iter / (elapsed / COUNT) / 1e9
         log(f"[{r}] [STANDARD] {COUNT} iters: total {elapsed:.4f}s, "
             f"avg {avg_ms:.2f}ms, ~{bw_gbps:.2f} GB/s")
+        return elapsed
 
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-    ) as prof:
-        with record_function("bitscom"):
-            bench_bitscom()
-        with record_function("standard"):
-            bench_standard()
+    # 注意：corex 平台上 torch.profiler(ProfilerActivity.CUDA + profile_memory)
+    # 的 CUPTI/memory hook 会跨段死锁，先去掉纯跑。需要 trace 再单独加回来。
+    t_bitscom = bench_bitscom()
+    t_standard = bench_standard()
 
     if rank == 0:
-        prof.export_chrome_trace("./trace.json")
-        log("[0] trace exported to ./trace.json")
+        log("=" * 60)
+        log(f"RESULT BITSCOM : total {t_bitscom:.4f}s  avg {t_bitscom / COUNT * 1000:.2f}ms/iter")
+        log(f"RESULT STANDARD: total {t_standard:.4f}s  avg {t_standard / COUNT * 1000:.2f}ms/iter")
+        log(f"RESULT SPEEDUP : {t_standard / t_bitscom:.2f}x (standard / bitscom)")
+        log("=" * 60)
 
     dist.barrier()
     dist.destroy_process_group()
