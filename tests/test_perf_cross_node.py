@@ -125,8 +125,10 @@ def main():
     dump_env(rank, world_size)
 
     bitscom_pg = dist.new_group(ranks=list(range(world_size)), backend="lowbit")
-    standard_pg = dist.new_group(ranks=list(range(world_size)), backend="nccl")
-    log(f"[{rank}] step3: new_group(lowbit/nccl) done")
+    # 标准 baseline 直接用默认组（backend=nccl），不要 new_group(nccl)：
+    # 否则会创建第 3 个 NCCL 通信子（默认组 + lowbit 内部组 + 这个），
+    # 实测 CCL 上第 3 个 comm 会卡死。standard 的 collective 用 group=None 走默认组。
+    log(f"[{rank}] step3: new_group(lowbit) done (standard 用默认 nccl 组)")
 
     dist.barrier()
     if rank == 0:
@@ -178,7 +180,7 @@ def main():
         log(f"[{r}] [STANDARD] 1/5 make_io done (input {ELEMS * world_size} elem)")
 
         log(f"[{r}] [STANDARD] 2/5 barrier begin")
-        dist.barrier(group=standard_pg)
+        dist.barrier()  # 默认组（nccl）
         log(f"[{r}] [STANDARD] 2/5 barrier done")
 
         torch.cuda.synchronize()
@@ -187,7 +189,7 @@ def main():
         start = time.perf_counter()
         for i in range(COUNT):
             log(f"[{r}] [STANDARD] 4/5 reduce_scatter_tensor iter {i} call")
-            dist.reduce_scatter_tensor(output, input_tensor, group=standard_pg)
+            dist.reduce_scatter_tensor(output, input_tensor)  # 默认组（nccl）
             log(f"[{r}] [STANDARD] 4/5 reduce_scatter_tensor iter {i} returned")
         log(f"[{r}] [STANDARD] 4/5 all iters dispatched, sync begin")
         torch.cuda.synchronize()
