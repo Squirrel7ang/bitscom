@@ -144,20 +144,35 @@ def main():
         return input_list, output
 
     def bench(pg, label):
+        # 每 rank 逐步打印，卡死时能看到是哪个 collective / 哪个 rank 没走到。
+        r = dist.get_rank()
+        log(f"[{r}] [{label}] 1/5 make_io begin")
         input_list, output = make_io()
+        log(f"[{r}] [{label}] 1/5 make_io done ({len(input_list)} x {ELEMS} elem)")
+
+        log(f"[{r}] [{label}] 2/5 barrier begin")
         dist.barrier(group=pg)
+        log(f"[{r}] [{label}] 2/5 barrier done")
+
         torch.cuda.synchronize()
+        log(f"[{r}] [{label}] 3/5 warm sync done, {COUNT} reduce_scatter begin")
+
         start = time.perf_counter()
-        for _ in range(COUNT):
+        for i in range(COUNT):
+            log(f"[{r}] [{label}] 4/5 reduce_scatter iter {i} call")
             dist.reduce_scatter(output=output, input_list=input_list, group=pg)
+            log(f"[{r}] [{label}] 4/5 reduce_scatter iter {i} returned")
+        log(f"[{r}] [{label}] 4/5 all iters dispatched, sync begin")
         torch.cuda.synchronize()
+        log(f"[{r}] [{label}] 5/5 sync done")
+
         end = time.perf_counter()
         elapsed = end - start
         avg_ms = elapsed / COUNT * 1000
         # 有效带宽：world_size 份 ELEMS*4B 在 ring 上近似搬一轮
         bytes_per_iter = world_size * ELEMS * 4
         bw_gbps = bytes_per_iter / (elapsed / COUNT) / 1e9
-        log(f"[{rank}] [{label}] {COUNT} iters: total {elapsed:.4f}s, "
+        log(f"[{r}] [{label}] {COUNT} iters: total {elapsed:.4f}s, "
             f"avg {avg_ms:.2f}ms, ~{bw_gbps:.2f} GB/s")
 
     with profile(
