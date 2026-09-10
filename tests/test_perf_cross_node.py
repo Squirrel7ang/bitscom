@@ -137,42 +137,70 @@ def main():
 
     torch.set_default_device(f"cuda:{torch.cuda.current_device()}")
 
-    def make_io():
-        # reduce_scatter: input_list 长度为 world_size，每个是本 rank 贡献的满尺寸张量
+    def bench_bitscom():
+        # bitscom 的 lowbit backend 沿用 list 形式的 reduce_scatter
+        # （input_list 长度为 world_size，每个是本 rank 贡献的满尺寸张量）。
+        r = dist.get_rank()
+        log(f"[{r}] [BITSCOM] 1/5 make_io begin")
         input_list = [torch.randn(ELEMS) for _ in range(world_size)]
         output = torch.zeros(ELEMS // world_size)
-        return input_list, output
+        log(f"[{r}] [BITSCOM] 1/5 make_io done ({len(input_list)} x {ELEMS} elem)")
 
-    def bench(pg, label):
-        # 每 rank 逐步打印，卡死时能看到是哪个 collective / 哪个 rank 没走到。
-        r = dist.get_rank()
-        log(f"[{r}] [{label}] 1/5 make_io begin")
-        input_list, output = make_io()
-        log(f"[{r}] [{label}] 1/5 make_io done ({len(input_list)} x {ELEMS} elem)")
-
-        log(f"[{r}] [{label}] 2/5 barrier begin")
-        dist.barrier(group=pg)
-        log(f"[{r}] [{label}] 2/5 barrier done")
+        log(f"[{r}] [BITSCOM] 2/5 barrier begin")
+        dist.barrier(group=bitscom_pg)
+        log(f"[{r}] [BITSCOM] 2/5 barrier done")
 
         torch.cuda.synchronize()
-        log(f"[{r}] [{label}] 3/5 warm sync done, {COUNT} reduce_scatter begin")
+        log(f"[{r}] [BITSCOM] 3/5 warm sync done, {COUNT} reduce_scatter begin")
 
         start = time.perf_counter()
         for i in range(COUNT):
-            log(f"[{r}] [{label}] 4/5 reduce_scatter iter {i} call")
-            dist.reduce_scatter(output=output, input_list=input_list, group=pg)
-            log(f"[{r}] [{label}] 4/5 reduce_scatter iter {i} returned")
-        log(f"[{r}] [{label}] 4/5 all iters dispatched, sync begin")
+            log(f"[{r}] [BITSCOM] 4/5 reduce_scatter iter {i} call")
+            dist.reduce_scatter(output=output, input_list=input_list, group=bitscom_pg)
+            log(f"[{r}] [BITSCOM] 4/5 reduce_scatter iter {i} returned")
+        log(f"[{r}] [BITSCOM] 4/5 all iters dispatched, sync begin")
         torch.cuda.synchronize()
-        log(f"[{r}] [{label}] 5/5 sync done")
+        log(f"[{r}] [BITSCOM] 5/5 sync done")
 
         end = time.perf_counter()
         elapsed = end - start
         avg_ms = elapsed / COUNT * 1000
-        # 有效带宽：world_size 份 ELEMS*4B 在 ring 上近似搬一轮
         bytes_per_iter = world_size * ELEMS * 4
         bw_gbps = bytes_per_iter / (elapsed / COUNT) / 1e9
-        log(f"[{r}] [{label}] {COUNT} iters: total {elapsed:.4f}s, "
+        log(f"[{r}] [BITSCOM] {COUNT} iters: total {elapsed:.4f}s, "
+            f"avg {avg_ms:.2f}ms, ~{bw_gbps:.2f} GB/s")
+
+    def bench_standard():
+        # 标准 NCCL 用 reduce_scatter_tensor：单个输入张量，自动按 world_size 沿 dim0 切分。
+        # input 形状 = [ELEMS * world_size]，output 形状 = [ELEMS]（本 rank 的分片）。
+        r = dist.get_rank()
+        log(f"[{r}] [STANDARD] 1/5 make_io begin")
+        input_tensor = torch.randn(ELEMS * world_size)
+        output = torch.zeros(ELEMS)
+        log(f"[{r}] [STANDARD] 1/5 make_io done (input {ELEMS * world_size} elem)")
+
+        log(f"[{r}] [STANDARD] 2/5 barrier begin")
+        dist.barrier(group=standard_pg)
+        log(f"[{r}] [STANDARD] 2/5 barrier done")
+
+        torch.cuda.synchronize()
+        log(f"[{r}] [STANDARD] 3/5 warm sync done, {COUNT} reduce_scatter_tensor begin")
+
+        start = time.perf_counter()
+        for i in range(COUNT):
+            log(f"[{r}] [STANDARD] 4/5 reduce_scatter_tensor iter {i} call")
+            dist.reduce_scatter_tensor(output, input_tensor, group=standard_pg)
+            log(f"[{r}] [STANDARD] 4/5 reduce_scatter_tensor iter {i} returned")
+        log(f"[{r}] [STANDARD] 4/5 all iters dispatched, sync begin")
+        torch.cuda.synchronize()
+        log(f"[{r}] [STANDARD] 5/5 sync done")
+
+        end = time.perf_counter()
+        elapsed = end - start
+        avg_ms = elapsed / COUNT * 1000
+        bytes_per_iter = world_size * ELEMS * 4
+        bw_gbps = bytes_per_iter / (elapsed / COUNT) / 1e9
+        log(f"[{r}] [STANDARD] {COUNT} iters: total {elapsed:.4f}s, "
             f"avg {avg_ms:.2f}ms, ~{bw_gbps:.2f} GB/s")
 
     with profile(
@@ -181,9 +209,9 @@ def main():
         profile_memory=True,
     ) as prof:
         with record_function("bitscom"):
-            bench(bitscom_pg, "BITSCOM")
+            bench_bitscom()
         with record_function("standard"):
-            bench(standard_pg, "STANDARD")
+            bench_standard()
 
     if rank == 0:
         prof.export_chrome_trace("./trace.json")
