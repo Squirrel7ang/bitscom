@@ -156,6 +156,9 @@ public:
         std::vector<at::Tensor>& tensors,
         const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override;
 
+    c10::intrusive_ptr<c10d::Work> barrier(
+        const c10d::BarrierOptions& opts = c10d::BarrierOptions()) override;
+
     c10::intrusive_ptr<c10d::Work> alltoall(
         std::vector<at::Tensor>& output_tensors,
         std::vector<at::Tensor>& input_tensors,

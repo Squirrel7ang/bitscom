@@ -1679,6 +1679,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::broadcast(
     return nccl_pg_->broadcast(tensors, opts);
 }
 
+c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::barrier(
+    const c10d::BarrierOptions& opts) {
+    // barrier 无需压缩，直接转发到底层 NCCL 的默认 barrier
+    return nccl_pg_->barrier(opts);
+}
+
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allgather(
     std::vector<std::vector<at::Tensor>>& output_tensors,
     std::vector<at::Tensor>& input_tensors,
