@@ -2418,11 +2418,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
             }
 
             at::Tensor priority_rows;
-            at::Tensor non_priority_rows;
             at::Tensor G;
             at::Tensor priority_indices;
-            at::Tensor is_non_priority;
-            int64_t nonK;
             int64_t K;
             int64_t n, m;
             // ====== ARC-Top-K（基于完整张量） ======
@@ -2456,86 +2453,66 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduceScatterSparse(
                 priority_indices = std::get<1>(topk_result);
                 priority_indices = std::get<0>(at::sort(priority_indices));
 
-                // priority_indices 已升序 [K]。补集用一个 bool 掩码 + 一次 scatter 得到：
-                // ones + scatter(false) 比之前的 zeros + index_put_(true) + logical_not 更轻，
-                // 且 scatter_ 走 1-D 专用 kernel，绕开了 advanced indexing 的 index_put_。
-                // 掩码 hoist 到外层，供下面的 masked_select / masked_scatter 复用，
-                // 不再单独物化 non_priority_indices 这个索引数组。
-                is_non_priority = at::ones({n},
-                    at::TensorOptions().dtype(at::kBool).device(G.device()));
-                is_non_priority.scatter_(0, priority_indices, false);
-                nonK = n - K;
+                // priority_indices 已升序 [K]。这里不再物化 non-priority 行（补集），
+                // 因为 non-priority 行是主体（n-K 行），单独 masked_select 太慢。
+                // 后续对整个梯度按 nonpri_mode 一次性同步，再用 priority 行覆盖回去。
 
-                // ====== 提取本 rank 的 priority / non-priority 行 ======
+                // ====== 提取 priority 行（K 行，小规模）======
                 priority_rows = G.index_select(0, priority_indices);           // K×m
-                non_priority_rows = (nonK > 0)
-                    ? G.masked_select(is_non_priority.view({n, 1})).view({nonK, m})
-                    : at::zeros({0, m}, G.options());
             }
             
 
-            /** ****** AllReduce（三条路径） ******
-             * 注意，这里要使用 all_reduce 来同步数据，之后舍弃掉一部分数据。这是最麻烦的地方。
-             * 举个例子
-             * rank 0: pri0  nonp0  nonp1  pri1
-             * rank 1: pri2  nonp2  nonp3  pri3
-             * 但是我们需要的结果是
-             * rank 0: pri0+pri2  nonp0+nonp2
-             * rank1: nonp1+nonp3  pri1+pri3
+            /** ****** AllReduce（整块同步 + priority 覆盖）******
+             * 不再单独选择 non-priority 行（太慢），改为：
+             * 1) 对整个梯度按 nonpri_mode 一次性同步（full 全精度 / quantize 量化 / discard 舍弃）；
+             * 2) 再对 priority 行（K 行）按 pri_mode 单独同步，覆盖回梯度对应行。
+             * 语义上等价于原来的「priority + non-priority 分路 allreduce」，
+             * 但省掉了 non-priority 行的 masked_select 与逐行填回。
              */
             const auto pri_mode = options_.sparse_priority_mode;
             const auto nonpri_mode = options_.sparse_non_priority_mode;
 
-            at::Tensor reduced_priority;
+            // ====== 第一步：整块同步整个梯度（依据 non-priority 模式）======
+            at::Tensor reduced_full;  // n×m，全局 reduce 后的完整梯度
+            if (nonpri_mode == SparseCommMode::kFull) { // Full: 全精度 allreduce
+                RECORD_USER_SCOPE("Whole Full");
+                auto full_flat = G.contiguous().view(-1);
+                std::vector<at::Tensor> full_vec = {full_flat};
+                nccl_pg_->allreduce(full_vec)->wait();
+                reduced_full = full_vec[0].view({n, m});
+            } else if (nonpri_mode == SparseCommMode::kQuantize) { // Quantize: 量化 allreduce
+                RECORD_USER_SCOPE("Whole Quant");
+                auto full_flat = G.contiguous().view(-1);
+                quantizedAllreduceTensor(
+                    full_flat, options_.sparse_non_priority_quantize_bitwidth);
+                reduced_full = full_flat.view({n, m});
+            } else { // Discard: 整块置零
+                RECORD_USER_SCOPE("Whole Discard");
+                reduced_full = at::zeros({n, m}, G.options());
+            }
+
+            // ====== 第二步：同步 priority 行并覆盖回完整梯度 ======
             if (pri_mode == SparseCommMode::kFull) { // Full: nccl 全精度 allreduce
                 RECORD_USER_SCOPE("Priority Full");
                 auto pri_flat = priority_rows.contiguous().view(-1);
                 std::vector<at::Tensor> pri_vec = {pri_flat};
                 nccl_pg_->allreduce(pri_vec)->wait();
-                reduced_priority = pri_vec[0].view({K, m});
-            } else if (pri_mode == SparseCommMode::kQuantize) { // Quantize: 复用 sparse allreduce
+                reduced_full.index_copy_(0, priority_indices, pri_vec[0].view({K, m}));
+            } else if (pri_mode == SparseCommMode::kQuantize) { // Quantize: 量化 allreduce
                 RECORD_USER_SCOPE("Priority Quant");
                 auto pri_flat = priority_rows.contiguous().view(-1);
                 quantizedAllreduceTensor(
                     pri_flat, options_.sparse_priority_quantize_bitwidth);
-                reduced_priority = pri_flat.view({K, m});
-            } else { // Discard: 置零即可，无需通信（各 rank 的 collective 序列一致）
+                reduced_full.index_copy_(0, priority_indices, pri_flat.view({K, m}));
+            } else { // Discard: priority 行置零
                 RECORD_USER_SCOPE("Priority Discard");
-                // reduced_priority = at::zeros_like(priority_rows);
-                // do nothing
+                reduced_full.index_fill_(0, priority_indices, 0);
             }
 
-            at::Tensor reduced_non_priority;
-            if (nonK <= 0 || nonpri_mode == SparseCommMode::kDiscard) {
-                RECORD_USER_SCOPE("Non-Priority Discard");
-                // do nothing
-            } else if (nonpri_mode == SparseCommMode::kFull) { // Full: nccl 全精度 allreduce
-                RECORD_USER_SCOPE("NonPriority Full");
-                auto nonpri_flat = non_priority_rows.contiguous().view(-1);
-                std::vector<at::Tensor> nonpri_vec = {nonpri_flat};
-                nccl_pg_->allreduce(nonpri_vec)->wait();
-                reduced_non_priority = nonpri_vec[0].view({nonK, m});
-            } else if (nonpri_mode == SparseCommMode::kQuantize) { // Quantize: 复用 sparse allreduce
-                RECORD_USER_SCOPE("NonPriority Quant");
-                auto nonpri_flat = non_priority_rows.contiguous().view(-1);
-                quantizedAllreduceTensor(
-                    nonpri_flat, options_.sparse_non_priority_quantize_bitwidth);
-                reduced_non_priority = nonpri_flat.view({nonK, m});
-            }
-
-            // ====== 拼接恢复成完整张量 → Scatter ======
+            // ====== Scatter：切出本 rank 的 shard 写回 output ======
             at::Tensor my_shard;
             {
                 RECORD_USER_SCOPE("Cat back");
-                auto reduced_full = at::zeros({n, m}, G.options());
-                if (pri_mode != SparseCommMode::kDiscard){
-                    reduced_full.index_copy_(0, priority_indices, reduced_priority);
-                }
-                if (nonpri_mode != SparseCommMode::kDiscard && nonK > 0) {
-                    reduced_full.masked_scatter_(is_non_priority.view({n, 1}),
-                                                 reduced_non_priority.view(-1));
-                }
-
                 // 按连续 chunk 切分：本 rank 拿到 [rank*shard_len, (rank+1)*shard_len)
                 // 注意 reduced_full 是 padded 后的 n*m 张量，尾部 padding 落在所有 shard 之外，
                 // 因此直接按原 full_numel 的 shard 边界切即可自然去掉 padding。
