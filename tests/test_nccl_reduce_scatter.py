@@ -85,9 +85,17 @@ def bench_reduce_scatter_tensor(rank: int, world_size: int, n: int, iters: int):
 
     log(f"[{rank}] [RS_TENSOR] warm-up barrier begin")
     dist.barrier()
-    log(f"[{rank}] [RS_TENSOR] warm-up barrier done, {iters} iters begin")
+    log(f"[{rank}] [RS_TENSOR] warm-up barrier done")
 
     torch.cuda.synchronize()
+
+    # 第一次通信不计时：NCCL 懒初始化 / kernel 编译 / 显存分配等首次开销较大，
+    # 会污染统计。先跑一遍 warm-up，再测后续 iters 次。
+    log(f"[{rank}] [RS_TENSOR] warm-up reduce_scatter call (untimed)")
+    dist.reduce_scatter_tensor(output, input_tensor)
+    log(f"[{rank}] [RS_TENSOR] warm-up reduce_scatter returned")
+    torch.cuda.synchronize()
+
     start = time.perf_counter()
     for i in range(iters):
         log(f"[{rank}] [RS_TENSOR] iter {i} call")
@@ -98,7 +106,7 @@ def bench_reduce_scatter_tensor(rank: int, world_size: int, n: int, iters: int):
 
     expected = torch.full((n,), expected_val, device="cuda")
     ok = check(rank, output, expected, "reduce_scatter_tensor")
-    log(f"[{rank}] [RS_TENSOR] {iters} iters: total {elapsed:.4f}s "
+    log(f"[{rank}] [RS_TENSOR] {iters} iters (excl. warm-up): total {elapsed:.4f}s "
         f"avg {elapsed / iters * 1000:.2f}ms/iter")
     return ok
 
@@ -115,9 +123,17 @@ def bench_reduce_scatter_list(rank: int, world_size: int, n: int, iters: int):
 
     log(f"[{rank}] [RS_LIST] warm-up barrier begin")
     dist.barrier()
-    log(f"[{rank}] [RS_LIST] warm-up barrier done, {iters} iters begin")
+    log(f"[{rank}] [RS_LIST] warm-up barrier done")
 
     torch.cuda.synchronize()
+
+    # 第一次通信不计时：NCCL 懒初始化 / kernel 编译 / 显存分配等首次开销较大，
+    # 会污染统计。先跑一遍 warm-up，再测后续 iters 次。
+    log(f"[{rank}] [RS_LIST] warm-up reduce_scatter call (untimed)")
+    dist.reduce_scatter(output=output, input_list=input_list)
+    log(f"[{rank}] [RS_LIST] warm-up reduce_scatter returned")
+    torch.cuda.synchronize()
+
     start = time.perf_counter()
     for i in range(iters):
         log(f"[{rank}] [RS_LIST] iter {i} call")
@@ -128,7 +144,7 @@ def bench_reduce_scatter_list(rank: int, world_size: int, n: int, iters: int):
 
     expected = torch.full((n,), expected_val, device="cuda")
     ok = check(rank, output, expected, "reduce_scatter(list)")
-    log(f"[{rank}] [RS_LIST] {iters} iters: total {elapsed:.4f}s "
+    log(f"[{rank}] [RS_LIST] {iters} iters (excl. warm-up): total {elapsed:.4f}s "
         f"avg {elapsed / iters * 1000:.2f}ms/iter")
     return ok
 
