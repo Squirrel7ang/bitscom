@@ -159,7 +159,14 @@ def main():
         f"({torch.cuda.get_device_name(local_rank)})")
 
     # 纯 NCCL，不引入 bitscom / lowbit backend。
-    dist.init_process_group(backend="nccl")
+    # 必须显式传 device_id：不传时 ProcessGroupNCCL 会退化成按全局 rank 猜设备
+    # （rank1 -> cuda:1），而本文件的张量都建在 torch.cuda.current_device()，
+    # 也就是上面 set_device() 选定的 cuda:local_rank 上。两者不一致时
+    # barrier 能过（它用通信子自己的设备），但 reduce_scatter 会直接死锁。
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device("cuda", local_rank),
+    )
     log(f"[{rank}] step1: init_process_group(nccl) done")
 
     dump_env(rank, world_size)

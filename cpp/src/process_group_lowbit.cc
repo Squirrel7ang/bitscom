@@ -392,6 +392,14 @@ ProcessGroupLowBit::ProcessGroupLowBit(
     nccl_options->timeout = options_.timeout;
     nccl_pg_ = c10::make_intrusive<c10d::ProcessGroupNCCL>(
         store, rank, size, std::move(nccl_options));
+    // 必须显式绑定本进程使用的 GPU。不绑定的话 ProcessGroupNCCL 会退化成
+    // 按全局 rank 猜设备（rank1 -> cuda:1），而本 backend 收到的张量都在
+    // 调用方 set_device() 选定的 current_device() 上（单卡每进程时是 cuda:0）。
+    // 通信子设备与张量设备不一致时 barrier 仍能通过（它用通信子自己的设备），
+    // 但 allreduce / reduce_scatter 会直接死锁。
+    if (at::cuda::is_available()) {
+        nccl_pg_->setBoundDeviceId(at::Device(at::kCUDA, c10::cuda::current_device()));
+    }
 
     error_feedback_mode_ = parseErrorFeedbackMode(options_);
     TORCH_CHECK(options_.block_size > 0, "block_size must be > 0, got ", options_.block_size);
