@@ -25,6 +25,19 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens1f0}"
 NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 
+# ---- corex 运行环境兜底 ----
+# 非交互式 ssh / 调度器不会加载 ~/.bashrc，LD_LIBRARY_PATH 为空时 NCCL 会在
+# 第一次通信直接段错误（exitcode -11/139），且不打印任何 NCCL INFO 日志。
+# 这里按登录 shell 的配置补齐，保证手工跑和 ssh 跑行为一致。
+COREX_PATH="${COREX_PATH:-/usr/local/corex-4.4.0}"
+if [[ -d "$COREX_PATH/lib64" ]]; then
+    export LD_LIBRARY_PATH="$COREX_PATH/lib64:/usr/local/corex/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export CPATH="$COREX_PATH/include${CPATH:+:$CPATH}"
+    export LIBRARY_PATH="$COREX_PATH/lib64${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    export CUDA_HOME="${CUDA_HOME:-$COREX_PATH}"
+fi
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+
 export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 export NCCL_SOCKET_IFNAME
