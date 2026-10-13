@@ -4,6 +4,7 @@
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/core/jit_type.h>
+#include <torch/library.h>  // c10::Dispatcher（调用注册在 _lowbit_cuda 的融合 kernel）
 
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #include <algorithm>
@@ -226,6 +227,178 @@ void warnSparseResolution(const SparseResolution& res, const LowBitOptions& opti
 }
 
 }  // namespace
+
+// ---- 融合 CUDA kernel 是否可用（由 bitscom._lowbit_cuda 在 import 时注册）----
+namespace {
+bool fusedPackRegistered() {
+    static const bool ok = [] {
+        try {
+            c10::Dispatcher::singleton().findSchemaOrThrow(
+                "bitscom_lowbit::blockwise_quantize_pack", "");
+            return true;
+        } catch (const c10::Error&) {
+            return false;
+        }
+    }();
+    return ok;
+}
+bool fusedUnpackRegistered() {
+    static const bool ok = [] {
+        try {
+            c10::Dispatcher::singleton().findSchemaOrThrow(
+                "bitscom_lowbit::blockwise_unpack_dequantize", "");
+            return true;
+        } catch (const c10::Error&) {
+            return false;
+        }
+    }();
+    return ok;
+}
+}  // namespace
+
+// ---- pack/unpack 的数学实现 ----
+// 抽成自由函数（不再依赖 ProcessGroupLowBit 实例，只吃 block_size），
+// 便于单测/基准直接从 Python 调用，与成员函数共用同一份实现。
+std::tuple<at::Tensor, at::Tensor> packTensorRef(
+    const at::Tensor& input, int bitwidth, int64_t block_size) {
+    // 快速路径：bw ∈ {1,2,4} 且满足 kernel 约束时调用融合 CUDA kernel。
+    // 注意 bw >= 8 语义不同（fp16 直通，非量化），必须走下面的老路径。
+    if (bitwidth == 1 || bitwidth == 2 || bitwidth == 4) {
+        const int per_byte = 8 / bitwidth;
+        if (input.is_cuda() && block_size % per_byte == 0 &&
+            fusedPackRegistered()) {
+            auto flat = input.contiguous().view(-1).to(at::kFloat);
+            static const auto op = c10::Dispatcher::singleton()
+                .findSchemaOrThrow("bitscom_lowbit::blockwise_quantize_pack", "")
+                .typed<std::tuple<at::Tensor, at::Tensor, int64_t>(
+                    const at::Tensor&, int64_t, int64_t, bool)>();
+            auto res = op.call(
+                flat, static_cast<int64_t>(bitwidth), block_size, false);
+            return std::make_tuple(std::get<0>(res), std::get<1>(res));
+        }
+    }
+
+    auto flat = input.contiguous().view(-1).to(at::kFloat);
+    TORCH_CHECK(
+        bitwidth == 1 || bitwidth == 2 || bitwidth == 4 || bitwidth >= 8,
+        "unsupported bitwidth for pack: ", bitwidth);
+
+    if (bitwidth >= 8) {
+        auto scale = at::ones({1}, flat.options());
+        auto packed = flat.to(at::kHalf).view(at::kByte).contiguous();
+        return std::make_tuple(packed, scale);
+    }
+
+    const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
+    const int qmax = (bitwidth == 1) ? 1 : ((1 << (bitwidth - 1)) - 1);
+    const int64_t numel = flat.numel();
+    if (numel == 0) {
+        auto scale = at::empty({0}, flat.options().dtype(at::kHalf));
+        auto packed = at::empty({0}, flat.options().dtype(at::kByte));
+        return std::make_tuple(packed, scale);
+    }
+
+    const int64_t num_blocks = (numel + block_size - 1) / block_size;
+    const int64_t padded = num_blocks * block_size;
+    if (padded != numel) {
+        auto zeros = at::zeros({padded - numel}, flat.options());
+        flat = at::cat({flat, zeros}, 0);
+    }
+
+    auto blocks = flat.view({num_blocks, block_size});
+    auto abs_blocks = at::abs(blocks);
+    auto max_abs = std::get<0>(abs_blocks.max(1));
+    auto scale = max_abs / static_cast<float>(qmax);
+    scale = at::where(max_abs > 0, scale, at::ones_like(scale));
+    auto scale_half = scale.to(at::kHalf);
+
+    auto scale_f = scale_half.to(at::kFloat);
+    auto normalized = abs_blocks / scale_f.unsqueeze(1);
+    auto mag = at::round(normalized);
+    auto signed_vals = (bitwidth == 1) ? mag : mag * at::sign(blocks);
+    auto q = signed_vals.clamp(qmin, qmax).to(at::kInt);
+    auto values = (q.view({-1}).slice(0, 0, numel) - qmin)
+                      .to(at::kInt)
+                      .contiguous()
+                      .view(-1);
+
+    const int per_byte = 8 / bitwidth;
+    const int64_t packed_numel = values.numel();
+    const int64_t pad = (per_byte - (packed_numel % per_byte)) % per_byte;
+    if (pad > 0) {
+        auto zeros = at::zeros({pad}, values.options());
+        values = at::cat({values, zeros}, 0);
+    }
+
+    values = values.view({-1, per_byte});
+    auto shifts = at::arange(0, per_byte, values.options()) * bitwidth;
+    auto packed = at::sum(at::bitwise_left_shift(values, shifts), 1).to(at::kByte);
+    return std::make_tuple(packed.contiguous(), scale_half);
+}
+
+at::Tensor unpackTensorRef(
+    const at::Tensor& packed,
+    int64_t numel,
+    const at::Tensor& scale,
+    c10::Device device,
+    at::ScalarType out_dtype,
+    int bitwidth,
+    int64_t block_size) {
+    // 快速路径：bw ∈ {1,2,4} 且满足 kernel 约束时调用融合 CUDA kernel。
+    if (bitwidth == 1 || bitwidth == 2 || bitwidth == 4) {
+        const int per_byte = 8 / bitwidth;
+        if (packed.is_cuda() && block_size % per_byte == 0 &&
+            fusedUnpackRegistered()) {
+            auto scales =
+                scale.scalar_type() == at::kHalf ? scale : scale.to(at::kHalf);
+            static const auto op = c10::Dispatcher::singleton()
+                .findSchemaOrThrow("bitscom_lowbit::blockwise_unpack_dequantize", "")
+                .typed<at::Tensor(
+                    const at::Tensor&, const at::Tensor&, int64_t, int64_t,
+                    int64_t, at::ScalarType)>();
+            return op.call(
+                packed, scales, static_cast<int64_t>(bitwidth), numel,
+                block_size, out_dtype).to(device);
+        }
+    }
+
+    if (bitwidth >= 8) {
+        auto half_view = packed.contiguous().view(at::kHalf).view({numel});
+        return half_view.to(device, out_dtype);
+    }
+
+    const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
+    const int mask = (1 << bitwidth) - 1;
+    const int per_byte = 8 / bitwidth;
+
+    auto packed_i = packed.contiguous().view(-1).to(at::kInt);
+    auto shifts = at::arange(0, per_byte, packed_i.options()) * bitwidth;
+    auto expanded = at::bitwise_and(
+        at::bitwise_right_shift(packed_i.unsqueeze(1), shifts),
+        mask).reshape(-1);
+    auto q = expanded.slice(0, 0, numel).to(at::kFloat) + static_cast<float>(qmin);
+
+    if (numel == 0) {
+        return q.to(device, out_dtype);
+    }
+
+    const int64_t num_blocks = scale.numel();
+    const int64_t expected_blocks = (numel + block_size - 1) / block_size;
+    TORCH_CHECK(
+        num_blocks == expected_blocks,
+        "scale blocks mismatch: got ", num_blocks, " expected ", expected_blocks);
+
+    const int64_t padded = num_blocks * block_size;
+    if (padded != numel) {
+        auto zeros = at::zeros({padded - numel}, q.options());
+        q = at::cat({q, zeros}, 0);
+    }
+
+    auto q_blocks = q.view({num_blocks, block_size});
+    auto scale_f = scale.to(at::kFloat).view({num_blocks, 1});
+    auto out = (q_blocks * scale_f).view({-1}).slice(0, 0, numel).to(device, out_dtype);
+    return out;
+}
 
 struct CudaEventHandle {
     cudaEvent_t event = nullptr;
@@ -527,64 +700,7 @@ ProcessGroupLowBit::~ProcessGroupLowBit() {
 // ---- pack/unpack 占位实现 ----
 
 std::tuple<at::Tensor, at::Tensor> ProcessGroupLowBit::pack(const at::Tensor& input) {
-    auto flat = input.contiguous().view(-1).to(at::kFloat);
-    const int bitwidth = options_.bitwidth;
-    TORCH_CHECK(
-        bitwidth == 1 || bitwidth == 2 || bitwidth == 4 || bitwidth >= 8,
-        "unsupported bitwidth for pack: ", bitwidth);
-
-    if (bitwidth >= 8) {
-        auto scale = at::ones({1}, flat.options());
-        auto packed = flat.to(at::kHalf).view(at::kByte).contiguous();
-        return std::make_tuple(packed, scale);
-    }
-
-    const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
-    const int qmax = (bitwidth == 1) ? 1 : ((1 << (bitwidth - 1)) - 1);
-    const int64_t numel = flat.numel();
-    if (numel == 0) {
-        auto scale = at::empty({0}, flat.options().dtype(at::kHalf));
-        auto packed = at::empty({0}, flat.options().dtype(at::kByte));
-        return std::make_tuple(packed, scale);
-    }
-
-    const int64_t block_size = options_.block_size;
-    const int64_t num_blocks = (numel + block_size - 1) / block_size;
-    const int64_t padded = num_blocks * block_size;
-    if (padded != numel) {
-        auto zeros = at::zeros({padded - numel}, flat.options());
-        flat = at::cat({flat, zeros}, 0);
-    }
-
-    auto blocks = flat.view({num_blocks, block_size});
-    auto abs_blocks = at::abs(blocks);
-    auto max_abs = std::get<0>(abs_blocks.max(1));
-    auto scale = max_abs / static_cast<float>(qmax);
-    scale = at::where(max_abs > 0, scale, at::ones_like(scale));
-    auto scale_half = scale.to(at::kHalf);
-
-    auto scale_f = scale_half.to(at::kFloat);
-    auto normalized = abs_blocks / scale_f.unsqueeze(1);
-    auto mag = at::round(normalized);
-    auto signed_vals = (bitwidth == 1) ? mag : mag * at::sign(blocks);
-    auto q = signed_vals.clamp(qmin, qmax).to(at::kInt);
-    auto values = (q.view({-1}).slice(0, 0, numel) - qmin)
-                      .to(at::kInt)
-                      .contiguous()
-                      .view(-1);
-
-    const int per_byte = 8 / bitwidth;
-    const int64_t packed_numel = values.numel();
-    const int64_t pad = (per_byte - (packed_numel % per_byte)) % per_byte;
-    if (pad > 0) {
-        auto zeros = at::zeros({pad}, values.options());
-        values = at::cat({values, zeros}, 0);
-    }
-
-    values = values.view({-1, per_byte});
-    auto shifts = at::arange(0, per_byte, values.options()) * bitwidth;
-    auto packed = at::sum(at::bitwise_left_shift(values, shifts), 1).to(at::kByte);
-    return std::make_tuple(packed.contiguous(), scale_half);
+    return packTensorRef(input, options_.bitwidth, options_.block_size);
 }
 
 at::Tensor ProcessGroupLowBit::unpack(
@@ -593,45 +709,8 @@ at::Tensor ProcessGroupLowBit::unpack(
     const at::Tensor& scale,
     c10::Device device,
     at::ScalarType out_dtype) {
-    const int bitwidth = options_.bitwidth;
-
-    if (bitwidth >= 8) {
-        auto half_view = packed.contiguous().view(at::kHalf).view({numel});
-        return half_view.to(device, out_dtype);
-    }
-
-    const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
-    const int mask = (1 << bitwidth) - 1;
-    const int per_byte = 8 / bitwidth;
-
-    auto packed_i = packed.contiguous().view(-1).to(at::kInt);
-    auto shifts = at::arange(0, per_byte, packed_i.options()) * bitwidth;
-    auto expanded = at::bitwise_and(
-        at::bitwise_right_shift(packed_i.unsqueeze(1), shifts),
-        mask).reshape(-1);
-    auto q = expanded.slice(0, 0, numel).to(at::kFloat) + static_cast<float>(qmin);
-
-    if (numel == 0) {
-        return q.to(device, out_dtype);
-    }
-
-    const int64_t block_size = options_.block_size;
-    const int64_t num_blocks = scale.numel();
-    const int64_t expected_blocks = (numel + block_size - 1) / block_size;
-    TORCH_CHECK(
-        num_blocks == expected_blocks,
-        "scale blocks mismatch: got ", num_blocks, " expected ", expected_blocks);
-
-    const int64_t padded = num_blocks * block_size;
-    if (padded != numel) {
-        auto zeros = at::zeros({padded - numel}, q.options());
-        q = at::cat({q, zeros}, 0);
-    }
-
-    auto q_blocks = q.view({num_blocks, block_size});
-    auto scale_f = scale.to(at::kFloat).view({num_blocks, 1});
-    auto out = (q_blocks * scale_f).view({-1}).slice(0, 0, numel).to(device, out_dtype);
-    return out;
+    return unpackTensorRef(
+        packed, numel, scale, device, out_dtype, options_.bitwidth, options_.block_size);
 }
 
 bool ProcessGroupLowBit::shouldUseLowBitAllreduce(
@@ -1988,63 +2067,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::alltoall_base(
 
 std::tuple<at::Tensor, at::Tensor> ProcessGroupLowBit::pack(
     const at::Tensor& input, int bitwidth) {
-    auto flat = input.contiguous().view(-1).to(at::kFloat);
-    TORCH_CHECK(
-        bitwidth == 1 || bitwidth == 2 || bitwidth == 4 || bitwidth >= 8,
-        "unsupported bitwidth for pack: ", bitwidth);
-
-    if (bitwidth >= 8) {
-        auto scale = at::ones({1}, flat.options());
-        auto packed = flat.to(at::kHalf).view(at::kByte).contiguous();
-        return std::make_tuple(packed, scale);
-    }
-
-    const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
-    const int qmax = (bitwidth == 1) ? 1 : ((1 << (bitwidth - 1)) - 1);
-    const int64_t numel = flat.numel();
-    if (numel == 0) {
-        auto scale = at::empty({0}, flat.options().dtype(at::kHalf));
-        auto packed = at::empty({0}, flat.options().dtype(at::kByte));
-        return std::make_tuple(packed, scale);
-    }
-
-    const int64_t block_size = options_.block_size;
-    const int64_t num_blocks = (numel + block_size - 1) / block_size;
-    const int64_t padded = num_blocks * block_size;
-    if (padded != numel) {
-        auto zeros = at::zeros({padded - numel}, flat.options());
-        flat = at::cat({flat, zeros}, 0);
-    }
-
-    auto blocks = flat.view({num_blocks, block_size});
-    auto abs_blocks = at::abs(blocks);
-    auto max_abs = std::get<0>(abs_blocks.max(1));
-    auto scale = max_abs / static_cast<float>(qmax);
-    scale = at::where(max_abs > 0, scale, at::ones_like(scale));
-    auto scale_half = scale.to(at::kHalf);
-
-    auto scale_f = scale_half.to(at::kFloat);
-    auto normalized = abs_blocks / scale_f.unsqueeze(1);
-    auto mag = at::round(normalized);
-    auto signed_vals = (bitwidth == 1) ? mag : mag * at::sign(blocks);
-    auto q = signed_vals.clamp(qmin, qmax).to(at::kInt);
-    auto values = (q.view({-1}).slice(0, 0, numel) - qmin)
-                      .to(at::kInt)
-                      .contiguous()
-                      .view(-1);
-
-    const int per_byte = 8 / bitwidth;
-    const int64_t packed_numel = values.numel();
-    const int64_t pad = (per_byte - (packed_numel % per_byte)) % per_byte;
-    if (pad > 0) {
-        auto zeros = at::zeros({pad}, values.options());
-        values = at::cat({values, zeros}, 0);
-    }
-
-    values = values.view({-1, per_byte});
-    auto shifts = at::arange(0, per_byte, values.options()) * bitwidth;
-    auto packed = at::sum(at::bitwise_left_shift(values, shifts), 1).to(at::kByte);
-    return std::make_tuple(packed.contiguous(), scale_half);
+    return packTensorRef(input, bitwidth, options_.block_size);
 }
 
 at::Tensor ProcessGroupLowBit::unpack(
@@ -2054,43 +2077,8 @@ at::Tensor ProcessGroupLowBit::unpack(
     c10::Device device,
     at::ScalarType out_dtype,
     int bitwidth) {
-    if (bitwidth >= 8) {
-        auto half_view = packed.contiguous().view(at::kHalf).view({numel});
-        return half_view.to(device, out_dtype);
-    }
-
-    const int qmin = (bitwidth == 1) ? 0 : -(1 << (bitwidth - 1));
-    const int mask = (1 << bitwidth) - 1;
-    const int per_byte = 8 / bitwidth;
-
-    auto packed_i = packed.contiguous().view(-1).to(at::kInt);
-    auto shifts = at::arange(0, per_byte, packed_i.options()) * bitwidth;
-    auto expanded = at::bitwise_and(
-        at::bitwise_right_shift(packed_i.unsqueeze(1), shifts),
-        mask).reshape(-1);
-    auto q = expanded.slice(0, 0, numel).to(at::kFloat) + static_cast<float>(qmin);
-
-    if (numel == 0) {
-        return q.to(device, out_dtype);
-    }
-
-    const int64_t block_size = options_.block_size;
-    const int64_t num_blocks = scale.numel();
-    const int64_t expected_blocks = (numel + block_size - 1) / block_size;
-    TORCH_CHECK(
-        num_blocks == expected_blocks,
-        "scale blocks mismatch: got ", num_blocks, " expected ", expected_blocks);
-
-    const int64_t padded = num_blocks * block_size;
-    if (padded != numel) {
-        auto zeros = at::zeros({padded - numel}, q.options());
-        q = at::cat({q, zeros}, 0);
-    }
-
-    auto q_blocks = q.view({num_blocks, block_size});
-    auto scale_f = scale.to(at::kFloat).view({num_blocks, 1});
-    auto out = (q_blocks * scale_f).view({-1}).slice(0, 0, numel).to(device, out_dtype);
-    return out;
+    return unpackTensorRef(
+        packed, numel, scale, device, out_dtype, bitwidth, options_.block_size);
 }
 
 bool ProcessGroupLowBit::shouldUseSparseAllreduce(

@@ -32,6 +32,20 @@ struct CudaEventHandle;
 struct LowBitAllreduceTask;
 class ProcessGroupLowBit;
 
+// ---- pack/unpack 的数学实现（与成员函数共用，供单测/基准直接调用）----
+// 将 float tensor 量化 + 打包为 uint8 buffer，返回 (packed, scale)
+std::tuple<at::Tensor, at::Tensor> packTensorRef(
+    const at::Tensor& input, int bitwidth, int64_t block_size);
+// 将 uint8 buffer 解包 + 反量化为 float tensor
+at::Tensor unpackTensorRef(
+    const at::Tensor& packed,
+    int64_t numel,
+    const at::Tensor& scale,
+    c10::Device device,
+    at::ScalarType out_dtype,
+    int bitwidth,
+    int64_t block_size);
+
 struct LowBitScheduledHandle {
     ProcessGroupLowBit* owner = nullptr;
     std::shared_ptr<LowBitAllreduceTask> task;

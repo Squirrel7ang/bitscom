@@ -85,3 +85,24 @@ PYBIND11_MODULE(_lowbit_cuda, m) {
         py::arg("block_size"),
         py::arg("dtype") = at::kFloat);
 }
+
+// ---- Dispatcher 注册 ----
+// _lowbit_c 是纯 CppExtension（无 nvcc），无法直接链接这里的 CUDA kernel。
+// 把融合 kernel 注册到 dispatcher，C++ 侧即可通过 c10::Dispatcher 调用。
+TORCH_LIBRARY(bitscom_lowbit, m) {
+    m.def(
+        "blockwise_quantize_pack(Tensor input, int bitwidth, int block_size, "
+        "bool stochastic_rounding) -> (Tensor, Tensor, int)");
+    m.def(
+        "blockwise_unpack_dequantize(Tensor packed, Tensor scales, int bitwidth, "
+        "int numel, int block_size, ScalarType dtype) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(bitscom_lowbit, CUDA, m) {
+    m.impl(
+        "blockwise_quantize_pack",
+        &bitscom::blockwise_quantize_pack_cuda);
+    m.impl(
+        "blockwise_unpack_dequantize",
+        &bitscom::blockwise_unpack_dequantize_cuda);
+}

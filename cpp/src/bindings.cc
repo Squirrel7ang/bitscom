@@ -146,6 +146,14 @@ PYBIND11_MODULE(_lowbit_c, m) {
             &bitscom::ProcessGroupLowBit::scheduledLowBitBlockCurrentStream,
             py::arg("handle"));
 
+    // pack/unpack 数学实现（与后端共用），供单测/基准直接调用
+    m.def("pack_ref", &bitscom::packTensorRef,
+          py::arg("input"), py::arg("bitwidth"), py::arg("block_size") = 256);
+    m.def("unpack_ref", &bitscom::unpackTensorRef,
+          py::arg("packed"), py::arg("numel"), py::arg("scale"),
+          py::arg("device"), py::arg("out_dtype"),
+          py::arg("bitwidth"), py::arg("block_size") = 256);
+
     // 暴露工厂函数
     m.def("create_backend", &createBackend,
           py::arg("store"),
