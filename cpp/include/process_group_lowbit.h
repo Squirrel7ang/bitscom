@@ -260,6 +260,12 @@ private:
         std::vector<at::Tensor>& output_tensors,
         std::vector<std::vector<at::Tensor>>& input_tensors,
         const c10d::ReduceScatterOptions& opts);
+    // 整张量量化 reduce_scatter（pack→alltoall→unpack→sum），bitwidth 显式指定。
+    // 非稀疏量化路径与稀疏 unify(Quant) 路径共用。
+    c10::intrusive_ptr<c10d::Work> quantizedReduceScatter(
+        std::vector<at::Tensor>& output_tensors,
+        std::vector<std::vector<at::Tensor>>& input_tensors,
+        int bitwidth);
     // 对一组 sub-tensor 执行 pack→alltoall→unpack→sum 的量化 reduce_scatter
     // inputs: world_size 个 flat tensor（每个 rank 贡献的数据）
     // 返回该 rank 分到的 reduced 结果

@@ -139,6 +139,92 @@ int64_t calMaxFactor(int64_t size) {
     return factor;
 }
 
+const char* sparseModeName(SparseCommMode mode) {
+    switch (mode) {
+        case SparseCommMode::kFull:
+            return "Full";
+        case SparseCommMode::kQuantize:
+            return "Quant";
+        case SparseCommMode::kDiscard:
+            return "Discard";
+    }
+    return "?";
+}
+
+// priority / non-priority 行的精度排序：Full > Quant(位宽越大越精确) > Discard。
+// 返回 >0 表示 (a_mode,a_bw) 比 (b_mode,b_bw) 更精确，0 表示同精度。
+int sparsePrecCompare(
+    SparseCommMode a_mode, int a_bw, SparseCommMode b_mode, int b_bw) {
+    auto level = [](SparseCommMode mode) {
+        switch (mode) {
+            case SparseCommMode::kFull:
+                return 2;
+            case SparseCommMode::kQuantize:
+                return 1;
+            default:
+                return 0;  // kDiscard
+        }
+    };
+    const int la = level(a_mode);
+    const int lb = level(b_mode);
+    if (la != lb) {
+        return la - lb;
+    }
+    if (a_mode == SparseCommMode::kQuantize) {
+        return a_bw - b_bw;
+    }
+    return 0;
+}
+
+// 根据 priority/non-priority 的精度关系决定 sparse 通信策略。
+// 规则：只要 non-priority 精度 >= priority 精度，就无需区分两种行，
+// 直接用 non-priority 的 mode/位宽统一通信；严格更高时额外告警（只会起反作用）。
+struct SparseResolution {
+    bool unify = false;               // true → 不区分 priority/non-priority，整块统一通信
+    bool warn_nonpri_better = false;  // non-priority 精度严格高于 priority → 需告警
+    bool degenerate = false;          // unify 且模式为 Discard → 梯度恒为零
+    SparseCommMode uni_mode = SparseCommMode::kFull;  // unify 时的通信模式（取 non-priority）
+    int uni_bw = 0;                                   // unify 时的量化位宽（取 non-priority）
+};
+
+SparseResolution resolveSparse(const LowBitOptions& options) {
+    SparseResolution res;
+    const int cmp = sparsePrecCompare(
+        options.sparse_non_priority_mode,
+        options.sparse_non_priority_quantize_bitwidth,
+        options.sparse_priority_mode,
+        options.sparse_priority_quantize_bitwidth);
+    if (cmp >= 0) {
+        res.unify = true;
+        res.warn_nonpri_better = (cmp > 0);
+        res.uni_mode = options.sparse_non_priority_mode;
+        res.uni_bw = options.sparse_non_priority_quantize_bitwidth;
+        res.degenerate = (res.uni_mode == SparseCommMode::kDiscard);
+    }
+    return res;
+}
+
+void warnSparseResolution(const SparseResolution& res, const LowBitOptions& options) {
+    if (res.warn_nonpri_better) {
+        TORCH_WARN_ONCE(
+            "bitscom sparse: non-priority precision (",
+            sparseModeName(options.sparse_non_priority_mode), " ",
+            options.sparse_non_priority_quantize_bitwidth,
+            "-bit) is higher than priority precision (",
+            sparseModeName(options.sparse_priority_mode), " ",
+            options.sparse_priority_quantize_bitwidth,
+            "-bit); this is counterproductive (important rows lose accuracy). ",
+            "Collapsing both to the non-priority precision (",
+            sparseModeName(res.uni_mode), " ", res.uni_bw,
+            "-bit) for all rows.");
+    }
+    if (res.degenerate) {
+        TORCH_WARN_ONCE(
+            "bitscom sparse: both priority and non-priority modes are Discard; ",
+            "gradient communication is skipped and the reduced output is zero.");
+    }
+}
+
 }  // namespace
 
 struct CudaEventHandle {
@@ -1669,6 +1755,29 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduce(
 
     // 稀疏化 ARC-Top-K 路径：与现有 lowbit 路径完全独立的选路
     if (shouldUseSparseAllreduce(opts)) {
+        // 精度关系判定：non-priority 精度 >= priority 精度时无需区分两种行，
+        // 整块用 non-priority 的 mode/位宽统一通信。
+        const SparseResolution res = resolveSparse(options_);
+        if (res.unify) {
+            warnSparseResolution(res, options_);
+            if (res.degenerate) {  // 两边都 Discard → 结果恒为零
+                for (auto& tensor : tensors) {
+                    tensor.zero_();
+                }
+                auto work = c10::make_intrusive<WorkBitscom>();
+                work->markCompleted(true);
+                return work;
+            }
+            if (res.uni_mode == SparseCommMode::kFull) {  // 统一全精度 → 普通 allreduce
+                return nccl_pg_->allreduce(tensors, opts);
+            }
+            for (auto& tensor : tensors) {  // 统一量化 → 整张量量化 allreduce
+                quantizedAllreduceTensor(tensor, res.uni_bw);
+            }
+            auto work = c10::make_intrusive<WorkBitscom>();
+            work->markCompleted(true);
+            return work;
+        }
         return allreduceSparse(tensors, opts);
     }
 
@@ -1716,6 +1825,24 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduce_scatter(
     // 稀疏化 ARC-Top-K 路径
     if (shouldUseSparseReduceScatter(opts)) {
         RECORD_USER_SCOPE("cpp ProcessGroupLowBit reduceScatterSparse ready to be called")
+        // 精度关系判定：若 non-priority 精度 >= priority 精度，则无需区分两种行，
+        // 整块用 non-priority 的 mode/位宽统一通信（恰好也消除了冗余的第二次通信）。
+        const SparseResolution res = resolveSparse(options_);
+        if (res.unify) {
+            warnSparseResolution(res, options_);
+            if (res.degenerate) {  // 两边都 Discard → 结果恒为零
+                for (auto& out : output_tensors) {
+                    out.zero_();
+                }
+                auto work = c10::make_intrusive<WorkBitscom>();
+                work->markCompleted(true);
+                return work;
+            }
+            if (res.uni_mode == SparseCommMode::kFull) {  // 统一全精度 → 普通 reduce_scatter
+                return nccl_pg_->reduce_scatter(output_tensors, input_tensors, opts);
+            }
+            return quantizedReduceScatter(output_tensors, input_tensors, res.uni_bw);
+        }
         return reduceScatterSparse(output_tensors, input_tensors, opts);
     }
 
@@ -1724,6 +1851,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduce_scatter(
         getSize() <= 1) {
         return nccl_pg_->reduce_scatter(output_tensors, input_tensors, opts);
     }
+
+    return quantizedReduceScatter(output_tensors, input_tensors, options_.bitwidth);
+}
+
+c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::quantizedReduceScatter(
+    std::vector<at::Tensor>& output_tensors,
+    std::vector<std::vector<at::Tensor>>& input_tensors,
+    int bitwidth) {
 
     TORCH_CHECK(
         output_tensors.size() == input_tensors.size(),
@@ -1780,7 +1915,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduce_scatter(
                 ": shard=", shard.numel(), " output=", s.out_numel);
 
             at::Tensor packed, scale;
-            std::tie(packed, scale) = pack(shard);
+            std::tie(packed, scale) = pack(shard, bitwidth);
             s.send_packed.push_back(packed);
             s.send_scales.push_back(scale);
             s.recv_packed.push_back(at::empty_like(packed));
@@ -1794,7 +1929,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduce_scatter(
     }
 
     auto anchor = phase1_works[0];
-    auto post_hook = [this, state, phase1_works, world_size]() mutable -> bool {
+    auto post_hook = [this, state, phase1_works, world_size, bitwidth]() mutable -> bool {
         RECORD_USER_SCOPE("Post Hook");
         for (auto& w : phase1_works) {
             if (!w->wait()) {
@@ -1810,7 +1945,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::reduce_scatter(
                     s.out_numel,
                     s.recv_scales[src],
                     s.output.device(),
-                    at::kFloat);
+                    at::kFloat,
+                    bitwidth);
                 local_sum.add_(fp);
             }
             s.output.copy_(local_sum.to(s.output.scalar_type()));
