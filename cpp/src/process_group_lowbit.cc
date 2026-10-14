@@ -7,6 +7,7 @@
 
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -124,6 +125,26 @@ ncclDataType_t ncclDataTypeFor(const at::Tensor& tensor) {
 }
 
 }  // namespace
+
+// ---- 传输字节记账 ----
+// 进程级累加器：每个低比特 all-reduce 的 phase1 记一次原始/量化 payload。
+// 训练循环每步 reset 再读，得到该步 DP 梯度同步的实际通信量。
+namespace {
+std::atomic<int64_t> g_dense_transfer_bytes{0};
+std::atomic<int64_t> g_compressed_transfer_bytes{0};
+}  // namespace
+
+void resetTransferStats() {
+    g_dense_transfer_bytes.store(0, std::memory_order_relaxed);
+    g_compressed_transfer_bytes.store(0, std::memory_order_relaxed);
+}
+
+std::vector<int64_t> getTransferStats() {
+    return {
+        g_dense_transfer_bytes.load(std::memory_order_relaxed),
+        g_compressed_transfer_bytes.load(std::memory_order_relaxed),
+    };
+}
 
 struct CudaEventHandle {
     cudaEvent_t event = nullptr;
@@ -737,6 +758,12 @@ std::shared_ptr<LowBitAllreduceTask> ProcessGroupLowBit::launchLowBitPhase1Order
             sent_fp_shards.reserve(world_size);
         }
 
+        // 该 tensor 一次 all-reduce 的 payload 记账：
+        // dense = 原始元素字节；compressed = 各 shard 的 packed + scales 字节之和。
+        const int64_t dense_delta =
+            s.flat.numel() * static_cast<int64_t>(s.flat.element_size());
+        int64_t compressed_delta = 0;
+
         for (const auto& shard : shards) {
             at::Tensor packed, scale;
             std::tie(packed, scale) = pack(shard);
@@ -744,6 +771,9 @@ std::shared_ptr<LowBitAllreduceTask> ProcessGroupLowBit::launchLowBitPhase1Order
                 this,
                 getRank(),
                 "ordered local pack shard launched shard_numel=" + std::to_string(shard.numel()));
+
+            compressed_delta += packed.numel() * static_cast<int64_t>(packed.element_size());
+            compressed_delta += scale.numel() * static_cast<int64_t>(scale.element_size());
 
             if (stage1_ef) {
                 auto approx = unpack(
@@ -760,6 +790,9 @@ std::shared_ptr<LowBitAllreduceTask> ProcessGroupLowBit::launchLowBitPhase1Order
             s.send_scales.push_back(scale);
             s.recv_scales.push_back(at::empty_like(scale));
         }
+
+        g_dense_transfer_bytes.fetch_add(dense_delta, std::memory_order_relaxed);
+        g_compressed_transfer_bytes.fetch_add(compressed_delta, std::memory_order_relaxed);
 
         if (stage1_ef) {
             const int64_t key = s.tensor_id;

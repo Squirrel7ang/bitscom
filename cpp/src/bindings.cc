@@ -133,4 +133,9 @@ PYBIND11_MODULE(_lowbit_c, m) {
                         py::arg("error_feedback_mode") = "auto",
                         py::arg("block_size") = 256,
                         py::arg("stage2_error_feedback") = true);
+
+    // 传输字节记账：训练侧每步 reset_transfer_stats() 再 get_transfer_stats()，
+    // 得到该步 DP 梯度同步的 dense / compressed payload 字节。
+    m.def("reset_transfer_stats", &bitscom::resetTransferStats);
+    m.def("get_transfer_stats", &bitscom::getTransferStats);
 }
