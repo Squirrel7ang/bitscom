@@ -250,6 +250,14 @@ private:
       std::deque<std::shared_ptr<LowBitAllreduceTask>> active_lowbit_tasks_;
 };
 
+// ---- 传输字节记账（供训练侧每步读取 DP 通信量：稠密 vs 量化）----
+// 每次低比特 all-reduce 的 phase1 处累加：
+//   dense      = 原始 payload 字节（numel × element_size）
+//   compressed = 量化后 payload 字节（packed + scales 的 element_size 之和）
+// 进程级累加，训练循环每步 reset 再读；与具体 process group 实例无关。
+void resetTransferStats();
+std::vector<int64_t> getTransferStats();  // 返回 {dense_bytes, compressed_bytes}
+
 // 工厂函数，用于 Python 侧 register_backend
 c10::intrusive_ptr<c10d::Backend> createProcessGroupLowBit(
     const c10::intrusive_ptr<c10d::Store>& store,

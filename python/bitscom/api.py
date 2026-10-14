@@ -22,6 +22,36 @@ from .quantization import (
 )
 
 
+def _lowbit_transfer_stats_module():
+    """返回 C++ 扩展模块（导出传输字节记账），不可用时返回 None。"""
+    try:
+        from . import _lowbit_c
+
+        return _lowbit_c
+    except Exception:
+        return None
+
+
+def reset_transfer_stats() -> None:
+    """清零进程级 DP 传输字节累加器（dense / compressed）。"""
+    mod = _lowbit_transfer_stats_module()
+    if mod is not None and hasattr(mod, "reset_transfer_stats"):
+        mod.reset_transfer_stats()
+
+
+def transfer_stats():
+    """返回自上次 reset 起的 (dense_bytes, compressed_bytes)。
+
+    只统计走 lowbit 后端的 DP all-reduce；dense 是原始 payload，
+    compressed 是 packed + scales 的字节数。扩展不可用时返回 (0, 0)。
+    """
+    mod = _lowbit_transfer_stats_module()
+    if mod is None or not hasattr(mod, "get_transfer_stats"):
+        return (0, 0)
+    values = mod.get_transfer_stats()
+    return (int(values[0]), int(values[1]))
+
+
 def _bitscom_timing_enabled() -> bool:
     return True
 
@@ -446,6 +476,14 @@ class LowBitGroup:
     @property
     def world_size(self) -> int:
         return dist.get_world_size(self.pg)
+
+    def reset_transfer_stats(self) -> None:
+        """清零传输字节累加器（配合 transfer_stats() 每步统计 DP 通信量）。"""
+        reset_transfer_stats()
+
+    def transfer_stats(self):
+        """返回 (dense_bytes, compressed_bytes)，累计自上次 reset。"""
+        return transfer_stats()
 
     def all_reduce(
         self,
