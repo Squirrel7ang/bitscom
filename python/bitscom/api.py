@@ -52,6 +52,48 @@ def transfer_stats():
     return (int(values[0]), int(values[1]))
 
 
+def _wait_work_bounded(work, op_name: str) -> None:
+    """Wait for a bitscom collective with a deadline instead of forever."""
+    if work is None:
+        return
+    try:
+        timeout_s = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "120"))
+    except (TypeError, ValueError):
+        timeout_s = 120.0
+    is_done = getattr(work, "is_completed", None) or getattr(
+        work, "isCompleted", None
+    )
+    if timeout_s <= 0 or is_done is None:
+        work.wait()
+        return
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            if is_done():
+                break
+        except Exception:
+            work.wait()
+            return
+        if time.monotonic() > deadline:
+            try:
+                rank = dist.get_rank() if dist.is_initialized() else -1
+            except Exception:
+                rank = -1
+            print(
+                f"[bitscom][comm-watchdog] INTERNAL_TIMEOUT rank={rank} "
+                f"op={op_name} timeout={timeout_s:.1f}s",
+                flush=True,
+            )
+            try:
+                dist.abort()
+            except Exception:
+                pass
+            time.sleep(2.0)
+            os._exit(3)
+        time.sleep(0.02)
+    work.wait()
+
+
 def _bitscom_timing_enabled() -> bool:
     return True
 
@@ -525,7 +567,7 @@ class LowBitGroup:
             work = dist.all_reduce(tensor, op=op, group=self.pg, async_op=True)
             if async_op:
                 return work
-            work.wait()
+            _wait_work_bounded(work, "backend_lowbit_allreduce")
             return None
 
         if (
@@ -555,7 +597,7 @@ class LowBitGroup:
                 )
                 if async_op:
                     return work
-                work.wait()
+                _wait_work_bounded(work, "local_group_dense_allreduce")
             return None
 
         if self._should_use_pipeline_a(op, local_group, inter_group):
@@ -608,7 +650,7 @@ class LowBitGroup:
             self._comm_debug("path=dense_all_reduce")
         work = dist.all_reduce(tensor, op=op, group=self.pg, async_op=True)
         if not async_op:
-            work.wait()
+            _wait_work_bounded(work, "dense_all_reduce")
             return None
         return work
 
@@ -1506,7 +1548,7 @@ class LowBitGroup:
             tensor.copy_(roundtrip_tensor(tensor, self.bitwidth))
         work = dist.all_gather(tensor_list, tensor, group=self.pg, async_op=True)
         if not async_op:
-            work.wait()
+            _wait_work_bounded(work, "all_gather")
             return None
         return work
 
@@ -1525,7 +1567,7 @@ class LowBitGroup:
             output, input_list, op=op, group=self.pg, async_op=True
         )
         if not async_op:
-            work.wait()
+            _wait_work_bounded(work, "reduce_scatter")
             return None
         return work
 
@@ -1538,7 +1580,7 @@ class LowBitGroup:
         """broadcast（通常不需要压缩）。"""
         work = dist.broadcast(tensor, src=src, group=self.pg, async_op=True)
         if not async_op:
-            work.wait()
+            _wait_work_bounded(work, "broadcast")
             return None
         return work
 

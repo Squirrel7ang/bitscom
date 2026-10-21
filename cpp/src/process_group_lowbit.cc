@@ -1669,6 +1669,20 @@ c10::cuda::CUDAStream ProcessGroupLowBit::getLowBitStream(int device_index, int 
     return *(inserted.first->second);
 }
 
+// ---- teardown ----
+
+void ProcessGroupLowBit::abort() {
+    if (nccl_pg_ != nullptr) {
+        nccl_pg_->abort();
+    }
+}
+
+void ProcessGroupLowBit::shutdown() {
+    if (nccl_pg_ != nullptr) {
+        nccl_pg_->shutdown();
+    }
+}
+
 // ---- 集合通信原语 ----
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupLowBit::allreduce(

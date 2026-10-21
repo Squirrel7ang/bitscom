@@ -118,6 +118,13 @@ public:
 
     // ---- 集合通信原语 ----
 
+    // Graceful teardown for destroy_process_group(). Without these, PyTorch
+    // falls back to the Backend base implementations (unsupported/no-op) and
+    // the underlying NCCL communicator is aborted later by its destructor,
+    // which can corrupt Corex device VA space (XID 24).
+    void abort() override;
+    void shutdown() override;
+
     c10::intrusive_ptr<c10d::Work> allreduce(
         std::vector<at::Tensor>& tensors,
         const c10d::AllreduceOptions& opts = c10d::AllreduceOptions()) override;
