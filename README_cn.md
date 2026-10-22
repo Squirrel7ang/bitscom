@@ -98,13 +98,22 @@ pip install -e .
 /home/aerith/miniforge3/envs/bitscom/bin/python -m pip install -e . --no-build-isolation
 ```
 
-Corex clang++ 编译链（Corex CUDA 位于 /usr/local/corex-4.4.0）：
+Corex clang++ 编译链。`/usr/local/corex` 是指向本机实际 Corex 版本的软链接
+（当前集群是 4.4.0，新机器是 4.5.0），直接用它，不要写死带版本号的路径：
 
 ```bash
-CUDA_HOME=/usr/local/corex-4.4.0 \
-BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++ \
-/root/miniconda3/envs/ytli_test/bin/python -m pip install -e . --no-build-isolation
+CUDA_HOME=/usr/local/corex \
+NCCL_LIB_DIR=/usr/local/corex/lib64 \
+NCCL_INCLUDE_DIR=/usr/local/corex/include \
+BITSCOM_CUDA_COMPILER=/usr/local/corex/bin/clang++ \
+/root/miniconda3/envs/udtca/bin/python -m pip install -e . --no-build-isolation
 ```
+
+同一条命令在 python3.10/torch 2.7.1 和 python3.12/torch 2.10.0 两套环境下都适用，
+扩展 ABI 由构建时的解释器决定。
+
+`ncclCommRevoke` 在运行时用 `dlsym` 探测：即使扩展是在导出该符号的 NCCL 上编译的，
+在未导出该符号的机器上也能正常加载。
 
 当前扩展构建会在仓库根目录生成 `compile_commands.json`，便于 clangd 索引。
 

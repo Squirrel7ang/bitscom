@@ -12,6 +12,7 @@
 import os
 import shutil
 import site
+import sys
 import sysconfig
 import json
 
@@ -28,7 +29,13 @@ def _existing(path):
 
 
 def _use_nvidia_cuda_headers(cuda_home):
-    return not (cuda_home and os.path.abspath(cuda_home) == "/usr/local/corex-4.4.0")
+    # Corex toolkits (4.4.0 / 4.5.0, either an explicit version dir or the
+    # /usr/local/corex symlink) ship their own headers; only fall back to the
+    # pip-provided NVIDIA headers on a real CUDA toolkit.
+    if not cuda_home:
+        return True
+    resolved = os.path.abspath(cuda_home)
+    return "corex" not in resolved.lower()
 
 
 def _collect_include_dirs():
@@ -37,9 +44,11 @@ def _collect_include_dirs():
         os.path.join(_PROJECT_ROOT, "cpp", "include"),
     ]
 
+    # /usr/local/corex is a symlink to whichever Corex version the host runs
+    # (4.4.0 here, 4.5.0 on the new machines), so it needs no version probing.
     cuda_home = os.environ.get("CUDA_HOME")
-    if not cuda_home and os.path.isdir("/usr/local/corex-4.4.0"):
-        cuda_home = "/usr/local/corex-4.4.0"
+    if not cuda_home and os.path.isdir("/usr/local/corex"):
+        cuda_home = "/usr/local/corex"
     if not cuda_home:
         cuda_home = "/usr/local/cuda"
 
@@ -53,10 +62,13 @@ def _collect_include_dirs():
     if env_include:
         include_dirs.append(env_include)
 
+    # Derive the package dir from the running interpreter so the build works on
+    # both python3.10 (torch 2.7.1) and python3.12 (torch 2.10.0) environments.
+    py_tag = "python{}.{}".format(*sys.version_info[:2])
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
         candidates = [
-            os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "nccl", "include"),
+            os.path.join(conda_prefix, "lib", py_tag, "site-packages", "nvidia", "nccl", "include"),
             os.path.join(conda_prefix, "include"),
         ]
         if _use_nvidia_cuda_headers(cuda_home):
@@ -65,7 +77,7 @@ def _collect_include_dirs():
                     os.path.join(
                         conda_prefix,
                         "lib",
-                        "python3.12",
+                        py_tag,
                         "site-packages",
                         "nvidia",
                         "cu13",
@@ -74,7 +86,7 @@ def _collect_include_dirs():
                     os.path.join(
                         conda_prefix,
                         "lib",
-                        "python3.12",
+                        py_tag,
                         "site-packages",
                         "nvidia",
                         "cuda_runtime",
@@ -189,6 +201,8 @@ def _lowbit_link_config():
         "torch_python",
         "c10",
         "c10_cuda",
+        # glibc < 2.34 keeps dlsym in libdl; runtime revoke probing needs it.
+        "dl",
     ]
     extra_link_args = []
 

@@ -85,7 +85,7 @@ def _rollback_and_exit(reason: str) -> None:
             reason,
             exit_code=3,
             device_index=int(os.environ.get("LOCAL_RANK", "0")),
-            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "20")),
+            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "10")),
         )
     except Exception as exc:
         print(f"[comm-watchdog] rollback unavailable: {exc!r}", flush=True)

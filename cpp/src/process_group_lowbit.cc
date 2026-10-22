@@ -18,9 +18,37 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <dlfcn.h>
+
 // Corex ships ncclCommRevoke in ixccl, but the shipped headers do not declare
 // it. nccl_revoke.py calls the same symbol through ctypes.
-extern "C" ncclResult_t ncclCommRevoke(ncclComm_t comm, int flags);
+// The symbol does not exist in older Corex NCCL builds (corex-4.4.0 as shipped
+// on this cluster), so it must be resolved at runtime: a direct call would make
+// the extension fail to load (or abort at the first call) on those hosts.
+typedef ncclResult_t (*ncclCommRevokeFn)(ncclComm_t comm, int flags);
+
+ncclCommRevokeFn resolveNcclCommRevoke() {
+    static ncclCommRevokeFn fn = []() -> ncclCommRevokeFn {
+        void* sym = dlsym(RTLD_DEFAULT, "ncclCommRevoke");
+        if (sym == nullptr) {
+            // The loaded libnccl may be linked with local/private scope; retry
+            // by opening the library file itself.
+            const char* candidates[] = {
+                "libnccl.so.2", "libnccl.so", "libixccl.so.2", "libixccl.so"};
+            for (const char* name : candidates) {
+                void* handle = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
+                if (handle != nullptr) {
+                    sym = dlsym(handle, "ncclCommRevoke");
+                    if (sym != nullptr) {
+                        break;
+                    }
+                }
+            }
+        }
+        return reinterpret_cast<ncclCommRevokeFn>(sym);
+    }();
+    return fn;
+}
 
 namespace bitscom {
 
@@ -572,7 +600,16 @@ int ProcessGroupLowBit::revokeLowBitComm() {
             this, getRank(), "lowbit revoke skipped: comm not initialized");
         return -1;
     }
-    const ncclResult_t res = ncclCommRevoke(comm, 0);
+    ncclCommRevokeFn revoke = resolveNcclCommRevoke();
+    if (revoke == nullptr) {
+        TORCH_WARN(
+            "ncclCommRevoke not exported by the loaded NCCL library, "
+            "lowbit comm rank=", getRank(), " cannot be revoked");
+        lowbitBackendTiming(
+            this, getRank(), "lowbit nccl comm revoke unavailable");
+        return -2;
+    }
+    const ncclResult_t res = revoke(comm, 0);
     TORCH_WARN(
         "ncclCommRevoke(lowbit comm) rank=", getRank(),
         " rc=", static_cast<int>(res));

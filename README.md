@@ -98,13 +98,24 @@ If using the tested conda environment in this repo:
 /home/aerith/miniforge3/envs/bitscom/bin/python -m pip install -e . --no-build-isolation
 ```
 
-Corex clang++ toolchain build (Corex CUDA at /usr/local/corex-4.4.0):
+Corex clang++ toolchain build. `/usr/local/corex` is a symlink to the Corex
+version installed on the host (4.4.0 on the current cluster, 4.5.0 on the new
+machines), so use it directly instead of a versioned path:
 
 ```bash
-CUDA_HOME=/usr/local/corex-4.4.0 \
-BITSCOM_CUDA_COMPILER=/usr/local/corex-4.4.0/bin/clang++ \
-/root/miniconda3/envs/ytli_test/bin/python -m pip install -e . --no-build-isolation
+CUDA_HOME=/usr/local/corex \
+NCCL_LIB_DIR=/usr/local/corex/lib64 \
+NCCL_INCLUDE_DIR=/usr/local/corex/include \
+BITSCOM_CUDA_COMPILER=/usr/local/corex/bin/clang++ \
+/root/miniconda3/envs/udtca/bin/python -m pip install -e . --no-build-isolation
 ```
+
+The same command works for both the python3.10/torch 2.7.1 and the
+python3.12/torch 2.10.0 environments; the extension ABI is produced per
+interpreter by the build.
+
+`ncclCommRevoke` is probed with `dlsym` at runtime, so an extension built on a
+host whose NCCL exports it still loads on a host whose NCCL does not.
 
 The extension build now emits `compile_commands.json` at repo root for clangd.
 
