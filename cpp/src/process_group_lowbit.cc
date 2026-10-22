@@ -18,6 +18,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// Corex ships ncclCommRevoke in ixccl, but the shipped headers do not declare
+// it. nccl_revoke.py calls the same symbol through ctypes.
+extern "C" ncclResult_t ncclCommRevoke(ncclComm_t comm, int flags);
+
 namespace bitscom {
 
 namespace {
@@ -559,6 +563,27 @@ bool ProcessGroupLowBit::useStage1ErrorFeedback() const {
 bool ProcessGroupLowBit::useStage2ErrorFeedback() const {
     return options_.stage2_error_feedback &&
         error_feedback_mode_ == ErrorFeedbackMode::kEF21Plus;
+}
+
+int ProcessGroupLowBit::revokeLowBitComm() {
+    ncclComm_t comm = lowbit_comm_;
+    if (comm == nullptr) {
+        lowbitBackendTiming(
+            this, getRank(), "lowbit revoke skipped: comm not initialized");
+        return -1;
+    }
+    const ncclResult_t res = ncclCommRevoke(comm, 0);
+    TORCH_WARN(
+        "ncclCommRevoke(lowbit comm) rank=", getRank(),
+        " rc=", static_cast<int>(res));
+    lowbitBackendTiming(
+        this, getRank(),
+        "lowbit nccl comm revoke rc=" + std::to_string(static_cast<int>(res)));
+    return static_cast<int>(res);
+}
+
+uintptr_t ProcessGroupLowBit::lowBitCommPtr() const {
+    return reinterpret_cast<uintptr_t>(lowbit_comm_);
 }
 
 void ProcessGroupLowBit::initLowBitComm() {

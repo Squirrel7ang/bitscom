@@ -120,7 +120,13 @@ PYBIND11_MODULE(_lowbit_c, m) {
         .def(
             "scheduled_lowbit_block_current_stream",
             &bitscom::ProcessGroupLowBit::scheduledLowBitBlockCurrentStream,
-            py::arg("handle"));
+            py::arg("handle"))
+        .def(
+            "revoke_lowbit_comm",
+            &bitscom::ProcessGroupLowBit::revokeLowBitComm)
+        .def(
+            "lowbit_comm_ptr",
+            &bitscom::ProcessGroupLowBit::lowBitCommPtr);
 
     // 暴露工厂函数
     m.def("create_backend", &createBackend,
