@@ -59,9 +59,12 @@ def _pipeline_a_worker(rank: int, world_size: int, init_file: str, q):
         max_val = expected.abs().max().clamp_min(1e-6)
         rel_err = max_abs_err / max_val
 
+        # NCCL-backed process groups only accept CUDA tensors; the values were
+        # computed from CUDA tensors above, so keep the reduce on the device.
         err_tensor = torch.tensor(
             [max_cross_rank_diff.item(), max_abs_err.item(), rel_err.item()],
             dtype=torch.float32,
+            device=f"cuda:{rank}",
         )
         dist.all_reduce(err_tensor, op=dist.ReduceOp.MAX)
 

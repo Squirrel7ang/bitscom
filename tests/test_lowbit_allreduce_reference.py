@@ -198,13 +198,16 @@ def _worker(rank: int, world_size: int, init_file: str, case: dict, q):
     try:
         bitwidth = int(case["bitwidth"])
         bitscom.init(bitwidth=bitwidth)
+        # Corex: the lowbit backend creates its ncclComm_t eagerly inside
+        # init_process_group, and ncclCommInitRank binds the *current* device.
+        # Both ranks defaulted to device 0 -> "Duplicate GPU detected".
+        torch.cuda.set_device(rank)
         dist.init_process_group(
             backend="lowbit",
             init_method=f"file://{init_file}",
             rank=rank,
             world_size=world_size,
         )
-        torch.cuda.set_device(rank)
 
         device = torch.device(f"cuda:{rank}")
         x = _make_case_input(rank, case, device)
@@ -241,13 +244,16 @@ def _worker_stochastic(rank: int, world_size: int, init_file: str, case: dict, q
     try:
         bitwidth = int(case["bitwidth"])
         bitscom.init(bitwidth=bitwidth)
+        # Corex: the lowbit backend creates its ncclComm_t eagerly inside
+        # init_process_group, and ncclCommInitRank binds the *current* device.
+        # Both ranks defaulted to device 0 -> "Duplicate GPU detected".
+        torch.cuda.set_device(rank)
         dist.init_process_group(
             backend="lowbit",
             init_method=f"file://{init_file}",
             rank=rank,
             world_size=world_size,
         )
-        torch.cuda.set_device(rank)
 
         device = torch.device(f"cuda:{rank}")
         x = _make_case_input(rank, case, device)
