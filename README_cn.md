@@ -112,6 +112,41 @@ BITSCOM_CUDA_COMPILER=/usr/local/corex/bin/clang++ \
 同一条命令在 python3.10/torch 2.7.1 和 python3.12/torch 2.10.0 两套环境下都适用，
 扩展 ABI 由构建时的解释器决定。
 
+### CoreX 4.5.0 线侧机器（云侧 `powerone1` / 边侧 `powerone2`）
+
+`powerone1`、`powerone2` 只是这两台机器的本地 ssh 别名（云侧 / 边侧），不是项目里
+的正式命名。它们（天数 TG-V300X，CoreX 4.5.0，conda 环境 `udtca`）上需要额外四处
+设置，否则上面的命令会失败：
+
+- **`libcudart.so` 必须来自工具链条。** CoreX 版 torch 不看 `CUDA_HOME`，而是对
+  已加载的 `libcudart.so` 做 `dladdr` 得到 `COREX_HOME`，再拿它当 `CUDA_HOME`。
+  如果 `LD_LIBRARY_PATH` 让 `libcudart` 命中
+  `<corex-toolkit>/ixdriver/lib64`，构建会报
+  `nvcc not found at '.../ixdriver/bin/nvcc'`。要把
+  `<repo-root>/.corex-4.5.0/lib64` 放到最前面。
+- `/usr/local/corex/include` 不是 CUDA_HOME 形状的头文件树，没有顶层的
+  `cuda_runtime.h`。用仓库旁边的工具链条 `<repo-root>/.corex-4.5.0`
+  （`bin/clang++` + `include/` + `lib64/`，由 CoreX 4.5.0 toolkit 组装）。
+- conda 环境里没有任何 NCCL，`-lnccl` 链接不到，把 `NCCL_LIB_DIR` 指到
+  `/usr/local/corex/lib64`。
+- CoreX 的 clang++ 22 会自动挑 gcc-12，但这些机器只装了 gcc-12 的 C 编译器
+  （没有 `cc1plus`，也没有 `/usr/include/c++/12`），所以找不到 `<climits>`；
+  用 `CPLUS_INCLUDE_PATH` 补上 gcc-11 的 C++ 头文件目录。
+
+```bash
+CX=/data/tangruijing/udtca/.corex-4.5.0
+export LD_LIBRARY_PATH=$CX/lib64:$LD_LIBRARY_PATH
+export CUDA_HOME=$CX
+export BITSCOM_CUDA_COMPILER=$CX/bin/clang++
+export NCCL_LIB_DIR=/usr/local/corex/lib64
+export CPLUS_INCLUDE_PATH=/usr/include/c++/11:/usr/include/x86_64-linux-gnu/c++/11
+/home/powerone/miniconda3/envs/udtca/bin/python -m pip install -e . --no-build-isolation
+```
+
+powerone2（边侧）的 `~/.bashrc` 里已经导出了这几项，所以在该机器的 `udtca` 环境里
+直接 `pip install -e . --no-build-isolation` 即可。这些变量只影响编译；训练时不
+需要，启动器会自己设置 CoreX 路径。
+
 `ncclCommRevoke` 在运行时用 `dlsym` 探测：即使扩展是在导出该符号的 NCCL 上编译的，
 在未导出该符号的机器上也能正常加载。
 

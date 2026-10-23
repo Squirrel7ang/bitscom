@@ -114,6 +114,43 @@ The same command works for both the python3.10/torch 2.7.1 and the
 python3.12/torch 2.10.0 environments; the extension ABI is produced per
 interpreter by the build.
 
+### CoreX 4.5.0 on the line-side machines (cloud `powerone1` / edge `powerone2`)
+
+`powerone1` and `powerone2` are just local SSH aliases for the cloud-side and
+edge-side boxes (TG-V300X, CoreX 4.5.0, conda env `udtca`). They need four
+extra settings; without them the command above fails on those hosts:
+
+- **`libcudart.so` must come from the toolkit bundle.** CoreX's torch does not
+  read `CUDA_HOME`: it `dladdr`s the already-loaded `libcudart.so` to derive
+  `COREX_HOME` and uses that as `CUDA_HOME`. If `LD_LIBRARY_PATH` resolves
+  `libcudart` to `<corex-toolkit>/ixdriver/lib64`, the build dies with
+  `nvcc not found at '.../ixdriver/bin/nvcc'`. Put
+  `<repo-root>/.corex-4.5.0/lib64` first.
+- `/usr/local/corex/include` is not a CUDA_HOME-shaped header tree there — it
+  has no top-level `cuda_runtime.h`. Use the bundle kept beside the repo,
+  `<repo-root>/.corex-4.5.0` (`bin/clang++` + `include/` + `lib64/`, assembled
+  from the CoreX 4.5.0 toolkit).
+- The conda env has no NCCL at all, so `-lnccl` cannot resolve; point
+  `NCCL_LIB_DIR` at `/usr/local/corex/lib64`.
+- CoreX clang++ 22 auto-picks gcc-12, but these hosts only install the gcc-12
+  C compiler (no `cc1plus`, no `/usr/include/c++/12`), so `<climits>` is not
+  found. Add the gcc-11 C++ include dirs with `CPLUS_INCLUDE_PATH`.
+
+```bash
+CX=/data/tangruijing/udtca/.corex-4.5.0
+export LD_LIBRARY_PATH=$CX/lib64:$LD_LIBRARY_PATH
+export CUDA_HOME=$CX
+export BITSCOM_CUDA_COMPILER=$CX/bin/clang++
+export NCCL_LIB_DIR=/usr/local/corex/lib64
+export CPLUS_INCLUDE_PATH=/usr/include/c++/11:/usr/include/x86_64-linux-gnu/c++/11
+/home/powerone/miniconda3/envs/udtca/bin/python -m pip install -e . --no-build-isolation
+```
+
+On powerone2 these are already exported from `~/.bashrc`, so a plain
+`pip install -e . --no-build-isolation` in the `udtca` env works there.
+Runtime (training) does not use any of this; the launcher sets its own
+CoreX paths.
+
 `ncclCommRevoke` is probed with `dlsym` at runtime, so an extension built on a
 host whose NCCL exports it still loads on a host whose NCCL does not.
 
