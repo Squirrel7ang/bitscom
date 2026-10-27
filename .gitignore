@@ -19,3 +19,5 @@ __pycache__/
 /build/
 # 编译出来的 cpp/cuda 扩展（由 setup.py / build 生成，不入库）
 *.so
+
+/debug_logs
