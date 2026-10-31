@@ -166,14 +166,6 @@ public:
     bool scheduledLowBitWait(const std::shared_ptr<LowBitScheduledHandle>& handle);
     bool scheduledLowBitBlockCurrentStream(const std::shared_ptr<LowBitScheduledHandle>& handle);
 
-    // In-process revoke of the lowbit NCCL communicator (Corex ncclCommRevoke).
-    // Safe to call from a watchdog thread while a collective is stuck; it never
-    // exits the process. Returns the ncclResult_t (0 == success), or -1 when the
-    // communicator has not been initialized yet.
-    int revokeLowBitComm();
-    // Raw ncclComm_t as an integer (0 when uninitialized), for ctypes callers.
-    uintptr_t lowBitCommPtr() const;
-
 private:
     // 底层 NCCL process group
     c10::intrusive_ptr<c10d::ProcessGroupNCCL> nccl_pg_;

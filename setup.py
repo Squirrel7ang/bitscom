@@ -201,8 +201,6 @@ def _lowbit_link_config():
         "torch_python",
         "c10",
         "c10_cuda",
-        # glibc < 2.34 keeps dlsym in libdl; runtime revoke probing needs it.
-        "dl",
     ]
     extra_link_args = []
 

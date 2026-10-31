@@ -147,9 +147,6 @@ powerone2（边侧）的 `~/.bashrc` 里已经导出了这几项，所以在该�
 直接 `pip install -e . --no-build-isolation` 即可。这些变量只影响编译；训练时不
 需要，启动器会自己设置 CoreX 路径。
 
-`ncclCommRevoke` 在运行时用 `dlsym` 探测：即使扩展是在导出该符号的 NCCL 上编译的，
-在未导出该符号的机器上也能正常加载。
-
 当前扩展构建会在仓库根目录生成 `compile_commands.json`，便于 clangd 索引。
 
 ## 测试

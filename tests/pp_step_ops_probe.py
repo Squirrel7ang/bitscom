@@ -38,9 +38,8 @@ schedule.step() 实际用到的通信，按出现顺序：
 `group_dst/group_src`（组内 rank），这里用等价的 `dst/src`（全局 rank）
 调用同一个 `dist.isend/irecv`。
 
-防挂死：CommWatchdog 默认 300 s 无心跳就 ncclCommRevoke 收尾 os._exit(124)；
+防挂死：卡住时由外部 kill -9 处理；不要用信号中断。
 内核日志（vmid/XID/page fault）自动落盘，规则与 pp_vote_hop_repro.py 相同。
-**不要**从外面套 timeout、不要 kill、不要 Ctrl-C。
 
 跑法（容器里，16 卡；单机即可，--pp-size 8 时 dp=2）：
 
@@ -218,21 +217,6 @@ def _pick_socket_ifname() -> str | None:
     return None
 
 
-def _load_revoke():
-    """唯一的可选外部依赖：防挂死用的 nccl_revoke（没有就只警告，不影响测试）。"""
-    revoke_dir = os.environ.get(
-        "UDTCA_REVOKE_DIR", "/data/tangruijing/udtca/experiments/qwen14b")
-    if revoke_dir not in sys.path:
-        sys.path.insert(0, revoke_dir)
-    try:
-        import nccl_revoke  # noqa: PLC0415
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARN: 加载 nccl_revoke 失败（{exc!r}），卡住时不会自动收尾",
-              flush=True)
-        return None
-    return nccl_revoke
-
-
 def _out(tag: str, msg: str, pp_rank: int) -> None:
     try:
         rank = dist.get_rank()
@@ -243,14 +227,13 @@ def _out(tag: str, msg: str, pp_rank: int) -> None:
 
 
 class Probe:
-    def __init__(self, args, device, group, pp_rank, pp_size, beat) -> None:
+    def __init__(self, args, device, group, pp_rank, pp_size) -> None:
         self.args = args
         self.device = device
         self.group = group
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.last = pp_size - 1
-        self.beat = beat
         # 激活/梯度的真实形状：per_device_batch × seq_len × hidden，bf16
         n = args.batch * args.seq_len * args.hidden
         self.fwd_in = torch.zeros(n, dtype=torch.bfloat16, device=device)
@@ -323,11 +306,9 @@ class Probe:
                 acc = acc * vote
             else:
                 acc = vote
-            self.beat("vote-fwd")
             if self.pp_rank < self.last:
                 _out("vote", f"round {r} send fwd -> {self.pp_rank + 1}", self.pp_rank)
                 dist.send(acc, dst=self._g(self.pp_rank + 1), group=self.group)
-            self.beat("vote-fwd-send")
 
             if self.pp_rank < self.last:
                 result = torch.zeros(1, dtype=torch.int32, device=self.device)
@@ -335,11 +316,9 @@ class Probe:
                 dist.recv(result, src=self._g(self.pp_rank + 1), group=self.group)
             else:
                 result = acc
-            self.beat("vote-bwd")
             if self.pp_rank > 0:
                 _out("vote", f"round {r} send bwd -> {self.pp_rank - 1}", self.pp_rank)
                 dist.send(result, dst=self._g(self.pp_rank - 1), group=self.group)
-            self.beat("vote-bwd-send")
             _out("vote", f"round {r} done {time.perf_counter() - t0:.3f}s",
                  self.pp_rank)
 
@@ -358,14 +337,12 @@ class Probe:
                 dist.recv_object_list(objs, src=self._g(self.pp_rank - 1),
                                       group=self.group, device=self.device,
                                       use_batch=True)
-                self.beat("meta-fwd")
             if self.pp_rank < self.last:
                 _out("meta", f"round {r} send_object_list fwd -> {self.pp_rank + 1}",
                      self.pp_rank)
                 dist.send_object_list([fwd], dst=self._g(self.pp_rank + 1),
                                       group=self.group, device=self.device,
                                       use_batch=True)
-                self.beat("meta-fwd-send")
 
             if self.pp_rank < self.last:
                 objs = [None]
@@ -374,14 +351,12 @@ class Probe:
                 dist.recv_object_list(objs, src=self._g(self.pp_rank + 1),
                                       group=self.group, device=self.device,
                                       use_batch=True)
-                self.beat("meta-bwd")
             if self.pp_rank > 0:
                 _out("meta", f"round {r} send_object_list bwd -> {self.pp_rank - 1}",
                      self.pp_rank)
                 dist.send_object_list([bwd], dst=self._g(self.pp_rank - 1),
                                       group=self.group, device=self.device,
                                       use_batch=True)
-                self.beat("meta-bwd-send")
             _out("meta", f"round {r} done {time.perf_counter() - t0:.3f}s",
                  self.pp_rank)
 
@@ -393,10 +368,8 @@ class Probe:
             t0 = time.perf_counter()
             _out("act", f"mb {m} recv(if any)", self.pp_rank)
             self._wait(self._fire(self._fwd_recv_ops()))
-            self.beat("act-recv")
             self._wait(pending)
             pending = self._fire(self._fwd_send_ops())
-            self.beat("act-send")
             _out("act", f"mb {m} done {time.perf_counter() - t0:.3f}s", self.pp_rank)
         self._wait(pending)
 
@@ -407,10 +380,8 @@ class Probe:
             t0 = time.perf_counter()
             _out("grad", f"mb {m} recv(if any)", self.pp_rank)
             self._wait(self._fire(self._bwd_recv_ops()))
-            self.beat("grad-recv")
             self._wait(pending)
             pending = self._fire(self._bwd_send_ops())
-            self.beat("grad-send")
             _out("grad", f"mb {m} done {time.perf_counter() - t0:.3f}s", self.pp_rank)
         self._wait(pending)
 
@@ -426,7 +397,6 @@ class Probe:
             _out("mixed", f"round {r} batch_isend_irecv(isend,irecv) <-> "
                           f"{self.pp_rank + 1}", self.pp_rank)
             self._wait(self._fire(ops))
-            self.beat("mixed")
             _out("mixed", f"round {r} done {time.perf_counter() - t0:.3f}s",
                  self.pp_rank)
 
@@ -441,7 +411,6 @@ class Probe:
         for _ in range(warmup):
             t0 = time.perf_counter()
             self._wait(self._fire(self._fwd_recv_ops()))
-            self.beat("loop-w-recv")
             self._wait(send_work)
             send_work = []
             fwd_sends = self._fwd_send_ops()
@@ -449,7 +418,6 @@ class Probe:
                 send_work = self._fire(fwd_sends)
                 fwd_sends = []
             fwd_idx += 1
-            self.beat("loop-w-send")
             _out("loop", f"warmup fwd {fwd_idx - 1} "
                          f"{time.perf_counter() - t0:.3f}s", self.pp_rank)
 
@@ -457,13 +425,11 @@ class Probe:
             t0 = time.perf_counter()
             self._wait(self._fire(fwd_sends + self._bwd_recv_ops()))
             fwd_sends = []
-            self.beat("loop-1b1f-recv")
             bwd_sends = self._bwd_send_ops()
             bwd_idx += 1
             if fwd_idx == mbs:
                 break
             self._wait(self._fire(bwd_sends + self._fwd_recv_ops()))
-            self.beat("loop-1b1f-fwd")
             fwd_sends = self._fwd_send_ops()
             fwd_idx += 1
             _out("loop", f"1b1f f={fwd_idx - 1} b={bwd_idx - 1} "
@@ -476,7 +442,6 @@ class Probe:
             self._wait(send_work)
             send_work = self._fire(self._bwd_send_ops())
             bwd_idx += 1
-            self.beat("loop-cool")
             _out("loop", f"cooldown b {bwd_idx - 1} "
                          f"{time.perf_counter() - t0:.3f}s", self.pp_rank)
         self._wait(send_work)
@@ -496,9 +461,6 @@ def main() -> int:
     ap.add_argument("--hidden", type=int, default=5120, help="Qwen2.5-14B hidden")
     ap.add_argument("--sync", action="store_true",
                     help="每个 op 后 torch.cuda.synchronize（torch 本身没有）")
-    ap.add_argument("--hang-timeout", type=float,
-                    default=float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "300")))
-    ap.add_argument("--no-watchdog", action="store_true")
     ap.add_argument("--no-dmesg", action="store_true")
     ap.add_argument("--dmesg-interval", type=float, default=10.0)
     args, unknown = ap.parse_known_args()
@@ -541,13 +503,6 @@ def main() -> int:
           f"NCCL_P2P_DISABLE={os.environ.get('NCCL_P2P_DISABLE', '-')} "
           f"sync={args.sync} phases={phases}", flush=True)
 
-    revoke = None if args.no_watchdog else _load_revoke()
-    watchdog = None
-    if revoke is not None:
-        watchdog = revoke.CommWatchdog(timeout_s=args.hang_timeout, exit_code=124)
-        watchdog.capture(force=True)
-        watchdog.touch()
-        watchdog.start()
 
     dmesg_tail = None
     if not args.no_dmesg and local_rank == 0:
@@ -557,9 +512,6 @@ def main() -> int:
         if args.dmesg_interval > 0:
             dmesg_tail.start()
 
-    def beat(tag: str = "") -> None:
-        if watchdog is not None:
-            watchdog.touch()
 
     rc = 0
     current = "init"
@@ -583,9 +535,8 @@ def main() -> int:
         pp_size = dist.get_world_size(group=pp_group)
         _out("init", f"pp_rank={pp_rank}/{pp_size} world={world} dp={dp_size}",
              pp_rank)
-        beat("mesh")
 
-        probe = Probe(args, device, pp_group, pp_rank, pp_size, beat)
+        probe = Probe(args, device, pp_group, pp_rank, pp_size)
         for ph in phases:
             current = ph
             t0 = time.perf_counter()
@@ -605,7 +556,6 @@ def main() -> int:
             else:
                 raise SystemExit(f"未知 phase: {ph}")
             _out("phase", f"{ph} PASS {time.perf_counter() - t0:.3f}s", pp_rank)
-            beat(f"phase-{ph}")
 
         _out("phase", f"SUMMARY PASS phases={phases} "
                       f"total={time.perf_counter() - t_start:.1f}s", pp_rank)
@@ -614,7 +564,6 @@ def main() -> int:
                       f"{type(exc).__name__}: {exc}", pp_rank)
         rc = 1
     finally:
-        # 注意：watchdog 一直留到最后；拆组本身也可能挂
         if dmesg_tail is not None:
             dmesg_tail.final()
         if not args.no_dmesg and local_rank == 0:
@@ -635,13 +584,8 @@ def main() -> int:
                     dump_dmesg_snapshot(log_dir, f"post_{current}_rc{rc}")
                 except Exception:  # noqa: BLE001
                     pass
-        if watchdog is not None:
-            watchdog.stop()
         try:
-            if revoke is not None and hasattr(revoke, "exit_now"):
-                revoke.exit_now(rc)
-            else:
-                os._exit(rc)
+            pass
         except Exception:  # noqa: BLE001
             os._exit(rc)
     return rc

@@ -19,10 +19,7 @@
 注意：这个探针不测“裸 isend/irecv 串行化”那个问题（那用
 p2p_bare_probe.py）。这里所有收发都用 batch_isend_irecv 提交。
 
-防挂死：主线程每完成一对 touch 心跳；超过 --hang-timeout 没有推进，
-CommWatchdog 会调 ncclCommRevoke 撤掉本 rank 的 NCCL comm，等本机各 rank
-静默后 os._exit(124)。全程不发信号、不 kill —— 也不要给这个脚本套 timeout
-或从外面 kill，那正是会打出 XID 24 让 GPU 永久挂死的路径。
+卡住时由外部 kill -9 处理（不要让 torch 自己 abort 在途通信）。
 
 跑法（容器里，16 卡，和失败时的规模一致）：
 
@@ -56,8 +53,7 @@ import torch.distributed as dist
 SHAPE = (1, 256, 5120)
 DTYPE = torch.bfloat16
 BYTES = SHAPE[0] * SHAPE[1] * SHAPE[2] * 2  # bf16 = 2 bytes
-# 进程组超时远大于 hang-timeout：先让 revoke 收尾，不让 torch 自己 abort
-# 在途通信（Corex 上那是 XID 24 的路径）。
+# 进程组超时设得很大，卡住时由外部 kill 处理。
 PG_TIMEOUT_S = 900
 
 DEFAULT_PAIRS = "0-8,1-9,2-10,3-11,4-12,5-13,6-14,7-15"
@@ -82,22 +78,6 @@ def _parse_pairs(spec: str, world: int) -> list[tuple[int, int]]:
     if not pairs:
         raise ValueError("--pairs 为空")
     return pairs
-
-
-def _load_revoke():
-    revoke_dir = os.environ.get(
-        "UDTCA_REVOKE_DIR", "/data/tangruijing/udtca/experiments/qwen14b"
-    )
-    if revoke_dir not in sys.path:
-        sys.path.insert(0, revoke_dir)
-    try:
-        import nccl_revoke  # noqa: PLC0415
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARN: 加载 nccl_revoke 失败（{exc!r}），卡住时不会自动收尾", flush=True)
-        return None
-    return nccl_revoke
-
-
 def _base() -> torch.Tensor:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(1234)
@@ -150,8 +130,6 @@ def main() -> int:
     ap.add_argument("--pairs", default=DEFAULT_PAIRS,
                     help=f"逗号分隔的 a-b 对，或 all；默认 {DEFAULT_PAIRS}")
     ap.add_argument("--iters", type=int, default=10, help="每对收发迭代次数")
-    ap.add_argument("--hang-timeout", type=float, default=120.0,
-                    help="多久没有推进就 revoke 退出（秒）")
     args = ap.parse_args()
 
     # 裸 torchrun 跑时没有启动器那套环境，这里补齐跑通和留证据所必需的
@@ -180,7 +158,6 @@ def main() -> int:
         return 2
     pairs = _parse_pairs(args.pairs, world)
 
-    revoke = _load_revoke()
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     try:
@@ -204,13 +181,6 @@ def main() -> int:
             flush=True,
         )
 
-    watchdog = None
-    if revoke is not None:
-        watchdog = revoke.CommWatchdog(timeout_s=args.hang_timeout, exit_code=124)
-        watchdog.capture(force=True)
-        watchdog.touch()
-        watchdog.start()
-
     base = _base()
     created: list[tuple[tuple[int, int], "dist.ProcessGroup"]] = []
     results: list[str] = []
@@ -225,14 +195,9 @@ def main() -> int:
                 rc = 1
                 results.append(f"{a}-{b}=GROUP_FAIL({type(exc).__name__})")
                 _log(rank, f"pair {a}-{b} 建组失败: {type(exc).__name__}: {exc}")
-                if watchdog is not None:
-                    watchdog.touch()
                 continue
             dt_group = time.perf_counter() - t0
             created.append(((a, b), pg))
-            if watchdog is not None:
-                watchdog.touch()
-
             # 非成员也要走完全部的 new_group 调用顺序，但不能进组内收发；
             # 也不能跳过下面的 barrier —— barrier 是 world 集合操作，
             # 少一个 rank 整组就会挂住。
@@ -242,8 +207,6 @@ def main() -> int:
                     times = []
                     for it in range(args.iters):
                         times.append(_transfer(pg, rank, peer, base, it, device))
-                        if watchdog is not None:
-                            watchdog.touch()
                     avg = sum(times) / len(times)
                     bw = BYTES / avg / 1e9 if avg > 0 else float("inf")
                     results.append(f"{a}-{b}=PASS")
@@ -254,9 +217,6 @@ def main() -> int:
                     results.append(f"{a}-{b}=FAIL({type(exc).__name__})")
                     _log(rank, f"pair {a}-{b}  group={dt_group:.3f}s  FAIL: "
                                f"{type(exc).__name__}: {exc}")
-                if watchdog is not None:
-                    watchdog.touch()  # 失败也要继续测下一对
-
             # 每对之间同步一次，保证所有 rank（含非成员）进度一致
             try:
                 dist.barrier()
@@ -265,8 +225,6 @@ def main() -> int:
 
         _log(rank, "SUMMARY " + " ".join(results))
     finally:
-        if watchdog is not None:
-            watchdog.stop()
         # 不再补一次 barrier：主循环每对之间已经同步过，某个 rank 异常时
         # 补 barrier 只会让其它 rank 二次挂住。
         try:

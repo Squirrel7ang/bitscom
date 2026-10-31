@@ -18,18 +18,13 @@
 每次迭代的 payload 不同，所以“收到了上一轮/垃圾数据”也会被抓到
 （挂了会打成 constant，例如 2.36936e-38 那种 min==max 的整块常量）。
 
-防挂死：主线程只在每个用例结束后 touch 心跳；超过 --hang-timeout 没有推进，
-CommWatchdog 会调 ncclCommRevoke 撤掉本 rank 的全部 NCCL comm，等本机各 rank
-都静默后再 os._exit(124)。全程不发任何信号、不 kill 进程 —— 也请不要给这个
-脚本套 timeout 或从外面 kill，那正是会打出 XID 24 让 GPU 永久挂死的路径。
-
 跑法（容器里，先确认没有别人的进程，机器状态正常）：
 
     cd /data/tangruijing/udtca/bitscom
     CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29531 \\
         tests/p2p_bare_probe.py 2>&1 | tee /data1/tangruijing/logs/p2p_probe_$(hostname).log
 
-    # 只有想复现双向死锁时才加（会等到 --hang-timeout 后 revoke 退出）
+    # 只有想复现双向死锁时才加（可能一直卡住，需要外部 kill -9）
     CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29531 \\
         tests/p2p_bare_probe.py --cases bare_simultaneous --iters 1 \\
         2>&1 | tee /data1/tangruijing/logs/p2p_probe_bare_$(hostname).log
@@ -51,8 +46,7 @@ import torch.distributed as dist
 
 SHAPE = (1, 256, 5120)
 DTYPE = torch.bfloat16
-# 进程组自身超时必须远大于 hang-timeout：先让 revoke 路径收尾，
-# 不要让 torch 的 NCCL watchdog 去 abort 在途通信（Corex 上那会打 XID 24）。
+# 进程组超时设得很大，卡住时由外部 kill 处理。
 PG_TIMEOUT_S = 900
 
 
@@ -147,21 +141,6 @@ SAFE_CASES = ("batched_mixed", "warmup_bare", "warmup_batch1")
 
 
 # ------------------------------------------------------------------ 工具
-
-
-def _load_revoke():
-    """加载 experiments/qwen14b/nccl_revoke.py；不可用时返回 None。"""
-    revoke_dir = os.environ.get("UDTCA_REVOKE_DIR", "/data/tangruijing/udtca/experiments/qwen14b")
-    if revoke_dir not in sys.path:
-        sys.path.insert(0, revoke_dir)
-    try:
-        import nccl_revoke  # noqa: PLC0415 - 延迟到运行时再找
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARN: 加载 nccl_revoke 失败（{exc!r}），只能跑安全用例", flush=True)
-        return None
-    return nccl_revoke
-
-
 def _new_group(world_size: int, device) -> "dist.ProcessGroup":
     kw = dict(ranks=list(range(world_size)), backend="nccl",
               timeout=timedelta(seconds=PG_TIMEOUT_S))
@@ -179,8 +158,6 @@ def main() -> int:
     ap.add_argument("--cases", default=",".join(SAFE_CASES),
                     help="逗号分隔，可选：%s" % ",".join(CASES))
     ap.add_argument("--iters", type=int, default=10, help="每个用例迭代次数")
-    ap.add_argument("--hang-timeout", type=float, default=120.0,
-                    help="多久没有推进就 revoke 退出（秒）")
     args = ap.parse_args()
 
     cases = [c.strip() for c in args.cases.split(",") if c.strip()]
@@ -197,12 +174,6 @@ def main() -> int:
     rank = int(os.environ.get("RANK", "0"))
     if world_size < 2:
         print(f"ERROR: 至少 2 个进程，当前 WORLD_SIZE={world_size}", file=sys.stderr)
-        return 2
-
-    revoke = _load_revoke()
-    if "bare_simultaneous" in cases and revoke is None:
-        print("ERROR: 没有 nccl_revoke，拒绝跑 bare_simultaneous（卡住后无法安全退出）",
-              file=sys.stderr)
         return 2
 
     torch.cuda.set_device(local_rank)
@@ -233,20 +204,11 @@ def main() -> int:
     if os.environ.get("NCCL_P2P_DISABLE", "0") not in ("0", ""):
         _log(rank, "WARN: NCCL_P2P_DISABLE 已设置，测到的是非直连路径，结论无效")
 
-    watchdog = None
-    if revoke is not None:
-        watchdog = revoke.CommWatchdog(timeout_s=args.hang_timeout, exit_code=124)
-        watchdog.capture(force=True)
-        watchdog.touch()
-        watchdog.start()
-
     base = _base()
     results = []
     rc = 0
     try:
         for name in cases:
-            if watchdog is not None:
-                watchdog.capture(force=True)
             _log(rank, f">>> {name} x{args.iters}")
             t_case = time.perf_counter()
             try:
@@ -254,8 +216,6 @@ def main() -> int:
                     CASES[name](pg, rank, world_size, device, base, it)
                     torch.cuda.synchronize()
                     dist.barrier(group=pg)
-                    if watchdog is not None:
-                        watchdog.touch()
                 dt = time.perf_counter() - t_case
                 results.append(f"{name}=PASS({dt:.1f}s)")
                 _log(rank, f"[PASS] {name} x{args.iters} ({dt:.1f}s)")
@@ -263,12 +223,8 @@ def main() -> int:
                 rc = 1
                 results.append(f"{name}=FAIL({type(exc).__name__})")
                 _log(rank, f"[FAIL] {name}: {type(exc).__name__}: {exc}")
-                if watchdog is not None:
-                    watchdog.touch()  # 失败也要继续，别让看门狗误判
         _log(rank, "SUMMARY " + " ".join(results))
     finally:
-        if watchdog is not None:
-            watchdog.stop()
         try:
             torch.cuda.synchronize()
             dist.barrier()

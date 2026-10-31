@@ -143,8 +143,7 @@ python -m pip install -e . --no-build-isolation
 ```
 
 Verified with `python -c "from bitscom._lowbit_c import ProcessGroupLowBit"`
-(also exposes `revoke_lowbit_comm`, `lowbit_comm_ptr`) and
-`import bitscom._lowbit_cuda`.
+and `import bitscom._lowbit_cuda`.
 
 Note: none of this is needed at training time; the launcher
 (`udtca-config/qwen14b/run_single_node.sh`) sets its own CoreX paths.

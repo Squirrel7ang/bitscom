@@ -30,13 +30,13 @@
   每个节点由 local rank 0 自动收集，全部落在文件里，跑完直接在 stdout 看统计：
     <log_dir>/dmesg_events_<host>.log          后台每 10 s 抓一次的新事件（卡死时也有）
     <log_dir>/dmesg_<host>_start_<时间>.txt     开跑前基线（full + _filtered.txt）
-    <log_dir>/dmesg_<host>_end_<phase>_rc<N>_<时间>.txt   收尾前（rc=0 通过，124 被 revoke）
+    <log_dir>/dmesg_<host>_end_<phase>_rc<N>_<时间>.txt   收尾前（rc=0 通过）
     <log_dir>/dmesg_<host>_post_<phase>_rc<N>_<时间>.txt  拆组之后
   统计行形如：`[hop dmesg rank=0 ...] powerone: vmid=0 xid=1 page_fault=1 events=3 -> ...`
   开跑前基线和结束各一份，直接 diff 就知道这次运行期间有没有新增 vmid 泄漏 / page fault。
 
-防挂死：CommWatchdog 默认 300 s 无心跳就 ncclCommRevoke 收尾 os._exit(124)。
-**不要**从外面套 timeout、不要 kill、不要 Ctrl-C（XID 24 会让卡永久挂死）。
+卡住时由外部 kill -9 处理。
+**不要**用信号中断（XID 24 会让卡永久挂死）。
 
 跑法（容器里，16 卡）：
 
@@ -124,17 +124,6 @@ def _load_entry(path: str):
     return module
 
 
-def _load_revoke():
-    revoke_dir = os.environ.get(
-        "UDTCA_REVOKE_DIR", "/data/tangruijing/udtca/experiments/qwen14b"
-    )
-    if revoke_dir not in sys.path:
-        sys.path.insert(0, revoke_dir)
-    import nccl_revoke  # noqa: PLC0415
-
-    return nccl_revoke
-
-
 def _read_dmesg() -> str | None:
     """读整份内核日志；容器里通常 dmesg 可用，不行再退到 /dev/kmsg。"""
     for cmd in (["dmesg", "-T"], ["dmesg"], ["cat", "/dev/kmsg"]):
@@ -165,8 +154,8 @@ def _dmesg_events(text: str) -> list[tuple[str, list[str]]]:
 class DmesgTail(threading.Thread):
     """后台按 interval 轮询 dmesg，把新出现的 vmid/XID/page fault 行实时落盘。
 
-    卡死时 CommWatchdog 会从另一个线程 os._exit，来不及做收尾统计；这份
-    tail 文件保证那时候证据已经在盘上。
+    卡死时进程会被外部杀掉，来不及做收尾统计；这份 tail 文件保证
+    那时候证据已经在盘上。
     """
 
     def __init__(self, path: str, interval_s: float = 10.0) -> None:
@@ -314,9 +303,6 @@ def main() -> int:
     ap.add_argument("--use-flash-attn", action=argparse.BooleanOptionalAction,
                     default=False)
     ap.add_argument("--init-from-pretrained", action="store_true", default=False)
-    ap.add_argument("--hang-timeout", type=float,
-                    default=float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "300")))
-    ap.add_argument("--no-watchdog", action="store_true")
     ap.add_argument("--no-dmesg", action="store_true",
                     help="关掉 dmesg 收集（不推荐）")
     ap.add_argument("--dmesg-interval", type=float, default=10.0,
@@ -367,13 +353,6 @@ def main() -> int:
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    revoke = None if args.no_watchdog else _load_revoke()
-    watchdog = None
-    if revoke is not None:
-        watchdog = revoke.CommWatchdog(timeout_s=args.hang_timeout, exit_code=124)
-        watchdog.capture(force=True)
-        watchdog.touch()
-        watchdog.start()
 
     # 每个节点只由 local rank 0 收内核日志（vmid 泄漏 / XID / page fault）
     dmesg_tail = None
@@ -386,9 +365,6 @@ def main() -> int:
             dmesg_tail.start()
         _log("dmesg", f"tail file: {dmesg_events_path}")
 
-    def beat(tag: str = "") -> None:
-        if watchdog is not None:
-            watchdog.touch()
 
     entry = None      # 只有 warmup 阶段才加载真实训练入口
     device_mesh = pp_group = None
@@ -436,7 +412,6 @@ def main() -> int:
         stage_model = entry.partition_qwen_model(model, pp_rank, args.pp_size,
                                                  debug_nan_steps=0)
         _log("init", f"partitioned stage={pp_rank}")
-        beat("partition")
 
         def loss_fn(output, target):
             return entry.vocab_parallel_lm_loss(
@@ -458,7 +433,6 @@ def main() -> int:
             use_local_sgd=False, local_sgd_steps=1, baseline_mode="manual",
         )
         _log("init", "PolarParallel init done")
-        beat("wrapper")
 
     def run_pair(n: int) -> None:
         src, dst = args.src, args.dst
@@ -469,34 +443,29 @@ def main() -> int:
                 _send(_one(device), pp_global(src), pp_group)
                 _log("pair", f"round {r} pre-forward send done "
                              f"{time.perf_counter() - t0:.3f}s")
-                beat(f"r{r}-pre")
             if pp_rank == src and args.pre_forward:
                 t0 = time.perf_counter()
                 _log("pair", f"round {r} pre-forward recv {src} <- {dst}")
                 _recv(_zero(device), pp_global(dst), pp_group)
                 _log("pair", f"round {r} pre-forward recv done "
                              f"{time.perf_counter() - t0:.3f}s")
-                beat(f"r{r}-pre")
             if pp_rank == src:
                 t0 = time.perf_counter()
                 _log("pair", f"round {r} send {src} -> {dst}")
                 _send(_one(device), pp_global(dst), pp_group)
                 _log("pair", f"round {r} send done {time.perf_counter() - t0:.3f}s")
-                beat(f"r{r}-pair")
             elif pp_rank == dst:
                 t0 = time.perf_counter()
                 _log("pair", f"round {r} recv {dst} <- {src}")
                 _recv(_zero(device), pp_global(src), pp_group)
                 _log("pair", f"round {r} recv done {time.perf_counter() - t0:.3f}s")
-                beat(f"r{r}-pair")
             else:
-                beat(f"r{r}-idle")
+                pass
 
     def run_chain(last: int, n: int) -> None:
         last = min(last, pp_size - 1)
         for r in range(n):
             if pp_rank > last:
-                beat(f"r{r}-idle")
                 continue
             t_round = time.perf_counter()
             vote = _one(device)
@@ -508,12 +477,10 @@ def main() -> int:
                 _recv(acc, pp_global(pp_rank - 1), pp_group)
                 _log("chain", f"round {r} recv fwd done")
                 acc = acc * vote
-            beat(f"r{r}-fwd-recv")
             if pp_rank < last:
                 _log("chain", f"round {r} send fwd -> {pp_rank + 1}")
                 _send(acc, pp_global(pp_rank + 1), pp_group)
                 _log("chain", f"round {r} send fwd done")
-            beat(f"r{r}-fwd-send")
             if pp_rank == last:
                 result = acc
             else:
@@ -521,12 +488,10 @@ def main() -> int:
                 _log("chain", f"round {r} recv bwd <- {pp_rank + 1}")
                 _recv(result, pp_global(pp_rank + 1), pp_group)
                 _log("chain", f"round {r} recv bwd done")
-            beat(f"r{r}-bwd-recv")
             if pp_rank > 0:
                 _log("chain", f"round {r} send bwd -> {pp_rank - 1}")
                 _send(result, pp_global(pp_rank - 1), pp_group)
                 _log("chain", f"round {r} send bwd done")
-            beat(f"r{r}-bwd-send")
             _log("chain", f"round {r} done {time.perf_counter() - t_round:.3f}s")
 
     def run_warmup(n: int) -> None:
@@ -537,7 +502,6 @@ def main() -> int:
             sched._warmup_p2p([trainer.stage], True, False)  # schedules.py:431
             _log("warmup", f"round {r} _warmup_p2p done "
                            f"{time.perf_counter() - t0:.3f}s")
-            beat(f"r{r}-warmup")
 
     rc = 0
     current = "init"
@@ -553,7 +517,6 @@ def main() -> int:
         build_mesh()
         _log("init", f"pp_rank={pp_rank}/{pp_size} world={world} dp={dp_size} "
                      f"phases={phases}")
-        beat("mesh")
 
         for ph in phases:
             current = ph
@@ -572,7 +535,6 @@ def main() -> int:
             else:
                 raise SystemExit(f"未知 phase: {ph}")
             _log("phase", f"{ph} PASS {time.perf_counter() - t0:.3f}s")
-            beat(f"phase-{ph}")
 
         _log("phase", f"SUMMARY PASS phases={phases} "
                       f"total={time.perf_counter() - t_start:.1f}s")
@@ -581,8 +543,6 @@ def main() -> int:
                       f"{type(exc).__name__}: {exc}")
         rc = 1
     finally:
-        if watchdog is not None:
-            watchdog.stop()
         # 先收内核日志，再拆组：vmid/page fault 往往就出现在拆卸或卡死之后
         if dmesg_tail is not None:
             dmesg_tail.final()
@@ -604,10 +564,7 @@ def main() -> int:
                 except Exception:  # noqa: BLE001
                     pass
         try:
-            if revoke is not None and hasattr(revoke, "exit_now"):
-                revoke.exit_now(rc)
-            else:
-                os._exit(rc)
+            pass
         except Exception:  # noqa: BLE001
             os._exit(rc)
     return rc

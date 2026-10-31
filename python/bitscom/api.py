@@ -52,47 +52,8 @@ def transfer_stats():
     return (int(values[0]), int(values[1]))
 
 
-def _nccl_revoke():
-    """Import the shared revoke/shutdown helpers (experiments/qwen14b)."""
-    import sys as _sys
-
-    _revoke_dir = os.environ.get(
-        "UDTCA_REVOKE_PY_DIR", "/data/tangruijing/udtca/experiments/qwen14b"
-    )
-    if _revoke_dir not in _sys.path:
-        _sys.path.insert(0, _revoke_dir)
-    import nccl_revoke
-
-    return nccl_revoke
-
-
-def _revoke_requested() -> bool:
-    """True once any rank of this node has started rolling the job back."""
-    try:
-        return _nccl_revoke().revoke_requested()
-    except Exception:
-        return False
-
-
-def _rollback_and_exit(reason: str) -> None:
-    """Revoke locally and exit once the node is quiescent (never a signal).
-
-    Returns only if the rollback cannot be coordinated; callers then keep the
-    process alive instead of exiting underneath their peers.
-    """
-    try:
-        _nccl_revoke().coordinated_shutdown(
-            reason,
-            exit_code=3,
-            device_index=int(os.environ.get("LOCAL_RANK", "0")),
-            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "10")),
-        )
-    except Exception as exc:
-        print(f"[comm-watchdog] rollback unavailable: {exc!r}", flush=True)
-
-
 def _wait_work_bounded(work, op_name: str) -> None:
-    """Wait for a bitscom collective; a hang rolls the job back and exits."""
+    """Wait for a bitscom collective; log once if it exceeds the watchdog."""
     if work is None:
         return
     try:
@@ -106,7 +67,6 @@ def _wait_work_bounded(work, op_name: str) -> None:
         work.wait()
         return
     deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
-    next_peer_check = time.monotonic() + 1.0
     timed_out = False
     while True:
         try:
@@ -116,12 +76,6 @@ def _wait_work_bounded(work, op_name: str) -> None:
             work.wait()
             return
         now = time.monotonic()
-        if now >= next_peer_check:
-            next_peer_check = now + 1.0
-            if _revoke_requested():
-                _rollback_and_exit(
-                    f"peer rank requested revoke while waiting for bitscom {op_name}"
-                )
         if deadline is not None and now > deadline and not timed_out:
             timed_out = True
             try:
@@ -129,14 +83,10 @@ def _wait_work_bounded(work, op_name: str) -> None:
             except Exception:
                 rank = -1
             print(
-                f"[bitscom][comm-watchdog] INTERNAL_TIMEOUT rank={rank} "
-                f"op={op_name} timeout={timeout_s:.1f}s",
+                f"[bitscom][comm] INTERNAL_TIMEOUT rank={rank} "
+                f"op={op_name} timeout={timeout_s:.1f}s (still waiting)",
                 flush=True,
             )
-            _rollback_and_exit(f"bitscom {op_name} timeout after {timeout_s:.1f}s")
-            # Rollback could not be coordinated: never exit underneath peers.
-            work.wait()
-            return
         time.sleep(0.02)
     work.wait()
 

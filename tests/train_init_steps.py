@@ -12,7 +12,7 @@
     7) token 缓存 + tokenizer + dataloader          入口 ~1447 / ~1474 / ~1523（--with-data）
     8) build_qwen_model + partition_qwen_model      入口 ~1479 / ~1482（--with-model）
     9) LowBitGroup 构造                             入口 ~1497（--method bitscom）
-   10) allow_tf32 + revoke-probe                    入口 ~1445 / ~1558
+   10) allow_tf32                                   入口 ~1445
    11) PolarParallel 构造 + train 循环入口           入口 ~1536 / ~1567（--with-trainer）
 
 第 11 步的 train() 完整跑完第一个 schedule.step（含前向+反向+PP 通信）
@@ -58,8 +58,7 @@ cuda.synchronize() + dist.barrier()，因此：
 注意：
   - NCCL 全量日志默认写到 $UDTCA_LOG_DIR（默认 /data1/tangruijing/logs）下的
     nccl_initsteps.<host>.<pid>.log；目录里没有新文件 = 进程从来没进过 NCCL。
-  - 默认挂 nvcc/revoke 看门狗（--hang-timeout，默认 180s，0 关闭）：卡住时
-    只做 ncclCommRevoke 然后自退，不发信号、不 kill。**不要**从外面套 timeout。
+  - 卡住时由外部 kill -9 处理，不要用信号中断。
   - 退出走训练入口同款顺序：barrier -> 各子组 -> world。
 """
 
@@ -338,23 +337,6 @@ def _detect_nic() -> str:
     except Exception:  # noqa: BLE001
         pass
     return ""
-
-
-def _load_revoke():
-    revoke_dir = os.environ.get(
-        "UDTCA_REVOKE_DIR", str(REPO_ROOT / "experiments" / "qwen14b")
-    )
-    if revoke_dir not in sys.path:
-        sys.path.insert(0, revoke_dir)
-    try:
-        import nccl_revoke  # noqa: PLC0415
-
-        return nccl_revoke
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARN: 加载 nccl_revoke 失败（{exc!r}），卡住时不会自动收尾", flush=True)
-        return None
-
-
 def _shutdown(rank: int) -> None:
     """训练入口同款的退出顺序：barrier -> 各子组 -> world。"""
     try:
@@ -436,8 +418,6 @@ def main() -> int:
     ap.add_argument("--max-steps", type=int, default=1,
                     help="只用于推 dataset_cache_samples，不训练")
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--hang-timeout", type=float, default=180.0,
-                    help="看门狗超时秒数，0 = 关闭")
     args = ap.parse_args()
 
     if "LOCAL_RANK" not in os.environ:
@@ -505,8 +485,6 @@ def main() -> int:
         pass
 
     device = torch.device(f"cuda:{local_rank}")
-    revoke = _load_revoke()
-    watchdog = None
 
     rc = 0
     try:
@@ -545,16 +523,6 @@ def main() -> int:
                 flush=True,
             )
 
-        # 看门狗要在 set_device 之后创建（CommWatchdog 会读 current_device）
-        if revoke is not None and args.hang_timeout > 0:
-            watchdog = revoke.CommWatchdog(timeout_s=args.hang_timeout, exit_code=124)
-            watchdog.capture(force=True)
-            watchdog.touch()
-            watchdog.start()
-            stage(rank, "watchdog started", f"timeout={args.hang_timeout}s")
-        if watchdog is not None:
-            watchdog.touch()
-
         # ---- 3) init_process_group（入口 ~1391，eager 初始化）
         _wd = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "600"))
         _pg_timeout = timedelta(
@@ -571,8 +539,6 @@ def main() -> int:
             rank, "3) init_process_group done",
             f"backend={dist.get_backend()} rank={dist.get_rank()}/{dist.get_world_size()}",
         )
-        if watchdog is not None:
-            watchdog.touch()
         torch.cuda.synchronize()
         dist.barrier()
         stage(rank, "3) first barrier ok")
@@ -593,8 +559,6 @@ def main() -> int:
             )
         dp_mesh = device_mesh["dp"]
         pp_mesh = device_mesh["pp"]
-        if watchdog is not None:
-            watchdog.touch()
         torch.cuda.synchronize()
         dist.barrier()
         stage(rank, "4) mesh checkpoint barrier ok")
@@ -605,8 +569,6 @@ def main() -> int:
             stage(rank, "5) create_lowbit_dp_group start")
             lowbit_dp_group = create_lowbit_dp_group(dp_mesh.get_group())
             stage(rank, "5) create_lowbit_dp_group done")
-            if watchdog is not None:
-                watchdog.touch()
             torch.cuda.synchronize()
             dist.barrier()
             stage(rank, "5) lowbit group checkpoint barrier ok")
@@ -672,8 +634,6 @@ def main() -> int:
             alloc, reserved = _mem_gib()
             stage(rank, "8) partition_qwen_model done",
                   f"stage_params={sum(p.numel() for p in stage_model.parameters()):,}")
-            if watchdog is not None:
-                watchdog.touch()
             torch.cuda.synchronize()
             dist.barrier()
             stage(rank, "8) model checkpoint barrier ok")
@@ -696,20 +656,6 @@ def main() -> int:
         # ---- 10) 入口在 trainer 之前做的两件小事
         torch.backends.cuda.matmul.allow_tf32 = True
         stage(rank, "10) allow_tf32=True")
-
-        # 入口启动时枚举每个 PG 是否可取消（只枚举，不 revoke）。
-        if os.environ.get("UDTCA_REVOKE_PROBE", "1") != "0":
-            try:
-                from nccl_revoke import _nccl_comms, revoke_summary
-
-                probe = _nccl_comms(int(os.environ.get("LOCAL_RANK", "0")))
-                stage(
-                    rank, "10) revoke-probe done",
-                    f"groups={revoke_summary().get('groups', 0)} "
-                    f"cancelable={len(probe)}",
-                )
-            except Exception as exc:  # noqa: BLE001
-                stage(rank, "10) revoke-probe unavailable", repr(exc))
 
         # ---- 11) PolarParallel 构造 + 进入 train 循环（在 schedule.step 前退出）
         if args.with_trainer:
@@ -748,8 +694,6 @@ def main() -> int:
                 baseline_mode="manual",
             )
             trainer.lowbit_group = lowbit_group
-            if watchdog is not None:
-                watchdog.touch()
             checkpoint(rank, "11) PolarParallel ready")
 
             stage(
@@ -774,8 +718,6 @@ def main() -> int:
         stage(rank, f"SUMMARY FAIL {type(exc).__name__}", str(exc))
         rc = 1
     finally:
-        if watchdog is not None:
-            watchdog.stop()
         if dist.is_initialized():
             _shutdown(rank)
     return rc

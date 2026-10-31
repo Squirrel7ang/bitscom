@@ -151,9 +151,6 @@ On powerone2 these are already exported from `~/.bashrc`, so a plain
 Runtime (training) does not use any of this; the launcher sets its own
 CoreX paths.
 
-`ncclCommRevoke` is probed with `dlsym` at runtime, so an extension built on a
-host whose NCCL exports it still loads on a host whose NCCL does not.
-
 The extension build now emits `compile_commands.json` at repo root for clangd.
 
 ## Test
